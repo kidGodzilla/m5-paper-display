@@ -1,0 +1,68 @@
+#pragma once
+
+// Wi-Fi credentials
+#ifndef WIFI_SSID
+#define WIFI_SSID "NETWORK_SSID"
+#endif
+#ifndef WIFI_PW
+#define WIFI_PW   "NETWORK_PASSWORD"
+#endif
+
+// Schedule API (example)
+#ifndef SCHEDULE_API_BASE
+#define SCHEDULE_API_BASE "https://api.meetingroom365.com"
+#endif
+
+// Room/display identifier
+#ifndef ROOM_ID
+#define ROOM_ID "displaykey"
+#endif
+
+// Display key alias (prefer this name in docs)
+#ifndef DISPLAY_KEY
+#define DISPLAY_KEY ROOM_ID
+#endif
+
+// Refresh interval seconds
+#ifndef REFRESH_SECONDS
+#define REFRESH_SECONDS 300
+#endif
+
+// Path to SD config
+#ifndef SD_CONFIG_PATH
+#define SD_CONFIG_PATH "/config.json"
+#endif
+
+// Optional TTF font paths on SD (root). If absent, built-in fonts are used
+#ifndef FONT_REGULAR_PATH
+#define FONT_REGULAR_PATH "/FreeSans.ttf"
+#endif
+#ifndef FONT_BOLD_PATH
+#define FONT_BOLD_PATH "/FreeSansBold.ttf"
+#endif
+
+// UI tunables
+#ifndef SCREEN_ROTATION
+#define SCREEN_ROTATION 90
+#endif
+#ifndef AVAILABLE_BG_SHADE
+#define AVAILABLE_BG_SHADE 0   // pure white
+#endif
+#ifndef OCCUPIED_BG_SHADE
+#define OCCUPIED_BG_SHADE 3   // subtle grey
+#endif
+#ifndef BUTTON_FILL_SHADE
+#define BUTTON_FILL_SHADE 1   // very light grey
+#endif
+#ifndef BUTTON_PRESSED_SHADE
+#define BUTTON_PRESSED_SHADE 5 // darker grey on press
+#endif
+#ifndef TEXT_COLOR_SHADE
+#define TEXT_COLOR_SHADE 14   // dark text
+#endif
+
+// Touch interrupt pin for wake
+#ifndef TOUCH_INT_PIN
+#define TOUCH_INT_PIN GPIO_NUM_36
+#endif
+

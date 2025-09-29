@@ -1,0 +1,6 @@
+{
+    "wifi_ssid": "YourWiFiSSID",
+    "wifi_password": "YourWiFiPassword",
+    "display_key": "yourdisplaykeyhere",
+    "refresh_seconds": 300
+  }
