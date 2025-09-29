@@ -49,7 +49,7 @@ static void useTTF(const char* path, int pixelSize) {
   canvas.loadFont(path, SD);
   canvas.createRender(pixelSize, 256);
   canvas.setTextSize(pixelSize);
-  canvas.setTextColor(14); // dark text (inverted mapping)
+  canvas.setTextColor(TEXT_COLOR_SHADE); // dark text
 }
 
 // Simple two-line word wrap for titles: splits near middle at space
@@ -134,6 +134,29 @@ void drawUI() {
 
   // Spacer
   y += 8;
+
+  // Battery indicator (top-right)
+  if (SHOW_BATTERY) {
+    // Read battery voltage and map to percent (3300-4350mV)
+    uint32_t mv = M5.getBatteryVoltage();
+    if (mv < 3300) mv = 3300; if (mv > 4350) mv = 4350;
+    int pct = (int)((mv - 3300) * 100 / (4350 - 3300));
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+
+    int bx = PORTRAIT_WIDTH - 24 - 80; // right margin 24, width ~80
+    int by = 24;                        // top margin
+    int bw = 80;
+    int bh = 28;
+    int capW = 6;
+    // body
+    canvas.drawRoundRect(bx, by, bw, bh, 6, TEXT_COLOR_SHADE);
+    // cap
+    canvas.drawRoundRect(bx + bw, by + (bh/4), capW, bh/2, 2, TEXT_COLOR_SHADE);
+    // fill
+    int innerW = bw - 6; int innerH = bh - 6;
+    int fillW = innerW * pct / 100;
+    canvas.fillRect(bx + 3, by + 3, fillW, innerH, TEXT_COLOR_SHADE);
+  }
 
   // Room name (large, left-aligned, bigger scale)
   y += 8;
