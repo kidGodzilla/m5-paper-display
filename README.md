@@ -1,4 +1,4 @@
-# M5Paper Meeting Room Display (Portrait)
+# M5Paper Meeting Room Display
 
 ## Overview
 
@@ -18,6 +18,12 @@ By default, it uses light sleep during business hours so touch can wake the devi
 
 - **Device**: M5Stack M5Paper (ESP32 + 960×540 e‑ink display)
 - **MicroSD Card**: Required for custom fonts and logo (optional for basic operation)
+
+
+https://shop.m5stack.com/products/m5papers3-esp32s3-development-kit
+
+This is also available in the US through Mouser.
+
 
 ## Dependencies
 
@@ -187,6 +193,4 @@ Copy `sd_card_example/config.example.json` to your SD card as `/config.json` and
   "deep_sleep_weekends": 0
 }
 ```
-
-## 
 
