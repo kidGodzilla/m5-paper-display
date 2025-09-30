@@ -15,6 +15,10 @@ Hardware
 
 - Device: M5Stack M5Paper (ESP32 + 960×540 e‑ink)
 
+https://shop.m5stack.com/products/m5papers3-esp32s3-development-kit
+
+This is also available in the US through Mouser.
+
 Dependencies
 
 - Arduino IDE or PlatformIO
