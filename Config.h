@@ -81,6 +81,11 @@
 #define TWENTYFOUR_HOUR 1
 #endif
 
+// Debug logging: 0=minimal (errors only), 1=verbose (all operations)
+#ifndef DEBUG_LOGGING
+#define DEBUG_LOGGING 1
+#endif
+
 // Power optimization toggles
 #ifndef EPD_POWER_OFF_IN_SLEEP
 #define EPD_POWER_OFF_IN_SLEEP 1 // disable EPD power during light sleep, re-enable on wake
@@ -88,36 +93,3 @@
 #ifndef EXTPWR_OFF_IN_SLEEP
 #define EXTPWR_OFF_IN_SLEEP 0 // usually keep EXTPower on so touch stays powered
 #endif
-// Optional TTF font paths on SD (root). If absent, built-in fonts are used
-#ifndef FONT_REGULAR_PATH
-#define FONT_REGULAR_PATH "/FreeSans.ttf"
-#endif
-#ifndef FONT_BOLD_PATH
-#define FONT_BOLD_PATH "/FreeSansBold.ttf"
-#endif
-
-// UI tunables
-#ifndef SCREEN_ROTATION
-#define SCREEN_ROTATION 90
-#endif
-#ifndef AVAILABLE_BG_SHADE
-#define AVAILABLE_BG_SHADE 0   // pure white
-#endif
-#ifndef OCCUPIED_BG_SHADE
-#define OCCUPIED_BG_SHADE 3   // subtle grey
-#endif
-#ifndef BUTTON_FILL_SHADE
-#define BUTTON_FILL_SHADE 1   // very light grey
-#endif
-#ifndef BUTTON_PRESSED_SHADE
-#define BUTTON_PRESSED_SHADE 5 // darker grey on press
-#endif
-#ifndef TEXT_COLOR_SHADE
-#define TEXT_COLOR_SHADE 14   // dark text
-#endif
-
-// Touch interrupt pin for wake
-#ifndef TOUCH_INT_PIN
-#define TOUCH_INT_PIN GPIO_NUM_36
-#endif
-

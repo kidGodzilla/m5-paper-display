@@ -6,6 +6,15 @@
 #include <ArduinoJson.h>
 #include "Config.h"
 
+// Debug logging macros (controlled by DEBUG_LOGGING in Config.h)
+#if DEBUG_LOGGING
+  #define LOG(...) Serial.printf(__VA_ARGS__)
+  #define LOGLN(x) Serial.println(x)
+#else
+  #define LOG(...)
+  #define LOGLN(x)
+#endif
+
 // Modern, minimal meeting room display for M5Paper in portrait orientation.
 // Layout (left-aligned text hierarchy):
 //  - Meeting Room Name (large)
@@ -70,7 +79,7 @@ static void clampAndLogRefresh() {
   if (refreshIntervalSeconds < 5) refreshIntervalSeconds = 5;
   if (refreshIntervalSeconds > 86400UL) refreshIntervalSeconds = 86400UL;
   if (refreshIntervalSeconds != before) {
-    Serial.printf("Clamped refreshSeconds from %lu to %lu\n", (unsigned long)before, (unsigned long)refreshIntervalSeconds);
+    LOG("Clamped refreshSeconds from %lu to %lu\n", (unsigned long)before, (unsigned long)refreshIntervalSeconds);
   }
 }
 
@@ -85,7 +94,7 @@ static void logWakeCause() {
     default: break;
   }
   unsigned long delta = (lastSleepMs == 0) ? 0 : (millis() - lastSleepMs);
-  Serial.printf("Wake cause=%s (%d), slept ~%lums\n", name, (int)cause, delta);
+  LOG("Wake cause=%s (%d), slept ~%lums\n", name, (int)cause, delta);
   if (cause == ESP_SLEEP_WAKEUP_TIMER) {
     consecutiveTimerWakeMisses = 0;
     consecutiveExt0Bounces = 0;
@@ -93,7 +102,7 @@ static void logWakeCause() {
   } else if (cause != ESP_SLEEP_WAKEUP_EXT0) {
     consecutiveTimerWakeMisses++;
     if (consecutiveTimerWakeMisses >= 3) {
-      Serial.println("Too many non-timer wakes in a row; restarting to recover");
+      Serial.println("ERROR: Too many non-timer wakes; restarting");
       delay(100);
       esp_restart();
     }
@@ -104,7 +113,7 @@ static void logWakeCause() {
       // apply cooldown immediately after a few bounces
       if (consecutiveExt0Bounces >= 3) {
         ext0CooldownUntilMs = millis() + 5000; // 5s without EXT0 to allow timer wake
-        Serial.println("EXT0 bouncing; applying 5s cooldown (skip arming EXT0)");
+        LOG("EXT0 bouncing; applying 5s cooldown (skip arming EXT0)\n");
       }
     } else {
       consecutiveExt0Bounces = 0;
@@ -121,10 +130,10 @@ static void rearmAndSleep() {
   #endif
   clampAndLogRefresh();
   uint64_t armUs2 = (uint64_t)refreshIntervalSeconds * 1000000ULL;
-  Serial.printf("Re-arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs2);
+  LOG("Re-arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs2);
   esp_sleep_enable_timer_wakeup(armUs2);
   bool extArmed2 = armExt0IfIdle();
-  Serial.printf("EXT0 armed=%s\n", extArmed2 ? "yes" : "no");
+  LOG("EXT0 armed=%s\n", extArmed2 ? "yes" : "no");
   WiFi.mode(WIFI_OFF);
   lastSleepMs = millis();
   esp_light_sleep_start();
@@ -227,10 +236,11 @@ void drawUI() {
   // Debug clock (top-left)
   if (SHOW_DEBUG_CLOCK) {
     time_t nowSecs = time(nullptr);
+    LOG("[drawUI] Debug clock: rawTime=%lu tzOffsetMin=%d\n", (unsigned long)nowSecs, tzOffsetMinutes);
     if (tzOffsetMinutes != 0) nowSecs += tzOffsetMinutes * 60;
     struct tm tinfo;
     gmtime_r(&nowSecs, &tinfo);
-    char buf[9];
+    char buf[16];
     if (TWENTYFOUR_HOUR) {
       snprintf(buf, sizeof(buf), "%02d:%02d", tinfo.tm_hour, tinfo.tm_min);
     } else {
@@ -238,6 +248,7 @@ void drawUI() {
       const char* ampm = (tinfo.tm_hour < 12) ? "AM" : "PM";
       snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, tinfo.tm_min, ampm);
     }
+    LOG("[drawUI] Debug clock text: %s\n", buf);
     canvas.setTextDatum(TL_DATUM);
     if (hasTTFFonts) { useTTF(FONT_REGULAR_PATH, 28); } else { canvas.setTextFont(1); canvas.setTextSize(3); }
     canvas.drawString(buf, margin, 20);
@@ -413,23 +424,33 @@ void drawUI() {
 static bool wifiConnected = false;
 
 static bool connectWiFi() {
+  LOG("[connectWiFi] Attempting to connect to '%s'...\n", wifiSsidStr.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.setAutoConnect(true);
   WiFi.setAutoReconnect(true);
   WiFi.begin(wifiSsidStr.c_str(), wifiPwStr.c_str());
-  for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; ++i) {
+  unsigned long start = millis();
+  for (int i = 0; i < 50 && WiFi.status() != WL_CONNECTED; ++i) {
     delay(200);
   }
   wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected) {
+    LOG("[connectWiFi] SUCCESS in %lums, IP=%s\n", millis() - start, WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("ERROR: Wi-Fi connect failed status=%d\n", (int)WiFi.status());
+    return false;
+  }
   if (wifiConnected && !timeSynced) {
+    LOG("[connectWiFi] Syncing NTP...\n");
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-    unsigned long start = millis();
+    unsigned long ntpStart = millis();
     time_t now = 0;
-    while ((now = time(nullptr)) < 1609459200 && millis() - start < 5000) { // wait up to ~5s
+    while ((now = time(nullptr)) < 1609459200 && millis() - ntpStart < 5000) { // wait up to ~5s
       delay(200);
     }
     timeSynced = (now >= 1609459200);
+    LOG("[connectWiFi] NTP sync %s (took %lums, now=%lu)\n", timeSynced ? "OK" : "TIMEOUT", millis() - ntpStart, (unsigned long)now);
   }
   return wifiConnected;
 }
@@ -441,7 +462,12 @@ static void disconnectWiFi() {
 }
 
 static bool fetchSchedule() {
-  if (!connectWiFi()) return false;
+  LOG("[fetchSchedule] Starting...\n");
+  if (!connectWiFi()) {
+    Serial.println("ERROR: fetchSchedule: Wi-Fi connect failed");
+    return false;
+  }
+  LOG("[fetchSchedule] Wi-Fi connected, building HTTP request\n");
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
@@ -450,16 +476,32 @@ static bool fetchSchedule() {
   g_action = 0;
   updateVoltageString();
   String url = String(SCHEDULE_API_BASE) + "/eink/" + displayKey + "?action=" + String(actionParam) + "&voltage=" + voltstr;
-  Serial.println(url);
-  if (!http.begin(client, url)) { disconnectWiFi(); return false; }
+  LOG("[fetchSchedule] URL: %s\n", url.c_str());
+  if (!http.begin(client, url)) {
+    Serial.println("ERROR: fetchSchedule: http.begin() failed");
+    disconnectWiFi();
+    return false;
+  }
+  LOG("[fetchSchedule] Sending GET request...\n");
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); disconnectWiFi(); return false; }
+  LOG("[fetchSchedule] HTTP response code=%d\n", code);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("ERROR: fetchSchedule: HTTP GET failed code=%d (%s)\n", code, http.errorToString(code).c_str());
+    http.end();
+    disconnectWiFi();
+    return false;
+  }
 
+  LOG("[fetchSchedule] Parsing JSON response...\n");
   DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, http.getStream());
   http.end();
   disconnectWiFi();
-  if (err) return false;
+  if (err) {
+    Serial.printf("ERROR: fetchSchedule: JSON parse error: %s\n", err.c_str());
+    return false;
+  }
+  LOG("[fetchSchedule] JSON parsed successfully\n");
 
   // Map fields per Meeting Room 365 e-ink API
   roomName            = doc["name"].as<String>();
@@ -482,6 +524,8 @@ static bool fetchSchedule() {
     tzOffsetMinutes = doc["timezone"].as<int>() * 60; // hours to minutes
   }
   // action already cleared above
+  LOG("[fetchSchedule] SUCCESS: room=%s occupied=%d canExtend=%d canEndMeeting=%d canInstantReserve=%d\n",
+      roomName.c_str(), occupied, canExtend, canEndMeeting, canInstantReserve);
 
   return true;
 }
@@ -504,7 +548,7 @@ static bool postReserve15() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("Booting M5Paper Meeting Room");
+  Serial.println("M5Paper Meeting Room Display");
   M5.begin(true, true, true, true); // enable SD
   M5.EPD.SetRotation(SCREEN_ROTATION); // rotate to portrait; canvas is 540x960
   M5.EPD.Clear(true);
@@ -536,7 +580,7 @@ void setup() {
           refreshIntervalSeconds = (uint32_t)refresh;
           Serial.println("Loaded SD config.json");
         } else {
-          Serial.println("Failed to parse config.json");
+          Serial.println("ERROR: Failed to parse config.json");
         }
       }
     }
@@ -545,9 +589,9 @@ void setup() {
   // Detect fonts on SD (paths at card root)
   if (SD.exists(FONT_REGULAR_PATH) && SD.exists(FONT_BOLD_PATH)) {
     hasTTFFonts = true;
-    Serial.println("TTF fonts found on SD");
+    LOG("TTF fonts found on SD\n");
   } else {
-    Serial.println("TTF fonts not found; using built-ins");
+    LOG("TTF fonts not found; using built-ins\n");
   }
 
   // Default placeholders when offline
@@ -558,7 +602,7 @@ void setup() {
 
   // Try fetch schedule
   if (!fetchSchedule()) {
-    Serial.println("fetchSchedule FAILED; using placeholders");
+    LOG("Initial fetchSchedule failed; using placeholders\n");
   }
 
   drawUI();
@@ -577,15 +621,15 @@ void setup() {
   #endif
   clampAndLogRefresh();
   uint64_t armUs = (uint64_t)refreshIntervalSeconds * 1000000ULL;
-  Serial.printf("Arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs);
+  LOG("Arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs);
   esp_sleep_enable_timer_wakeup(armUs);
   bool extArmed = armExt0IfIdle();
-  Serial.printf("EXT0 armed=%s\n", extArmed ? "yes" : "no");
+  LOG("EXT0 armed=%s\n", extArmed ? "yes" : "no");
   // Touch is initialized by M5.begin when touch is enabled; just set rotation
   M5.TP.SetRotation(SCREEN_ROTATION);
   WiFi.mode(WIFI_OFF);
   lastSleepMs = millis();
-  Serial.println("Entering light sleep");
+  LOG("Entering light sleep\n");
   esp_light_sleep_start();
 }
 
@@ -601,14 +645,22 @@ void loop() {
   delay(10); // allow rails to stabilize
   // If this was a timer wake, refresh data and UI immediately
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-    Serial.println("Timer wake: refreshing schedule and UI");
+    LOG("[loop] TIMER wake: refreshing schedule and UI\n");
+    timeSynced = false; // force NTP re-sync on next Wi-Fi connect
     updateVoltageString();
+    LOG("[loop] Voltage updated: %s\n", voltstr.c_str());
     if (!fetchSchedule()) {
-      Serial.println("Timer fetch failed; keeping previous UI");
+      LOG("[loop] fetchSchedule FAILED; keeping previous UI\n");
+    } else {
+      LOG("[loop] fetchSchedule SUCCESS\n");
     }
+    LOG("[loop] Drawing UI...\n");
     drawUI();
+    LOG("[loop] Pushing canvas to display...\n");
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-    delay(100);
+    LOG("[loop] Canvas pushed, waiting for e-ink refresh to complete...\n");
+    delay(2500); // Allow e-ink display time to complete physical refresh
+    LOG("[loop] Re-arming sleep after timer wake\n");
     rearmAndSleep();
     return;
   }
