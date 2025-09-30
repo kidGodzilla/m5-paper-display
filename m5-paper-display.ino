@@ -38,6 +38,12 @@ String voltstr              = "0.0";
 static unsigned long touchCooldownUntilMs = 0;
 static String wifiSsidStr = WIFI_SSID;
 static String wifiPwStr   = WIFI_PW;
+static bool timeSynced = false;
+static int tzOffsetMinutes = 0; // from API 'timezone' (hours) * 60
+static unsigned long lastSleepMs = 0;
+static uint32_t consecutiveTimerWakeMisses = 0;
+static uint32_t consecutiveExt0Bounces = 0;
+static unsigned long ext0CooldownUntilMs = 0;
 
 M5EPD_Canvas canvas(&M5.EPD);
 
@@ -50,6 +56,89 @@ static void useTTF(const char* path, int pixelSize) {
   canvas.createRender(pixelSize, 256);
   canvas.setTextSize(pixelSize);
   canvas.setTextColor(TEXT_COLOR_SHADE); // dark text
+}
+
+static void updateVoltageString() {
+  uint32_t mv = M5.getBatteryVoltage();
+  if (mv < 300) mv = 0; // guard weird reads
+  float v = mv / 1000.0f;
+  voltstr = String(v, 2);
+}
+
+static void clampAndLogRefresh() {
+  uint32_t before = refreshIntervalSeconds;
+  if (refreshIntervalSeconds < 5) refreshIntervalSeconds = 5;
+  if (refreshIntervalSeconds > 86400UL) refreshIntervalSeconds = 86400UL;
+  if (refreshIntervalSeconds != before) {
+    Serial.printf("Clamped refreshSeconds from %lu to %lu\n", (unsigned long)before, (unsigned long)refreshIntervalSeconds);
+  }
+}
+
+static void logWakeCause() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  const char* name = "OTHER";
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_TIMER: name = "TIMER"; break;
+    case ESP_SLEEP_WAKEUP_EXT0:  name = "EXT0";  break;
+    case ESP_SLEEP_WAKEUP_EXT1:  name = "EXT1";  break;
+    case ESP_SLEEP_WAKEUP_TOUCHPAD: name = "TOUCHPAD"; break;
+    default: break;
+  }
+  unsigned long delta = (lastSleepMs == 0) ? 0 : (millis() - lastSleepMs);
+  Serial.printf("Wake cause=%s (%d), slept ~%lums\n", name, (int)cause, delta);
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    consecutiveTimerWakeMisses = 0;
+    consecutiveExt0Bounces = 0;
+    ext0CooldownUntilMs = 0;
+  } else if (cause != ESP_SLEEP_WAKEUP_EXT0) {
+    consecutiveTimerWakeMisses++;
+    if (consecutiveTimerWakeMisses >= 3) {
+      Serial.println("Too many non-timer wakes in a row; restarting to recover");
+      delay(100);
+      esp_restart();
+    }
+  } else {
+    // EXT0 bounce (very short sleep) or stuck INT
+    if (delta < 100) {
+      consecutiveExt0Bounces++;
+      // apply cooldown immediately after a few bounces
+      if (consecutiveExt0Bounces >= 3) {
+        ext0CooldownUntilMs = millis() + 5000; // 5s without EXT0 to allow timer wake
+        Serial.println("EXT0 bouncing; applying 5s cooldown (skip arming EXT0)");
+      }
+    } else {
+      consecutiveExt0Bounces = 0;
+    }
+  }
+}
+
+static void rearmAndSleep() {
+  #if EPD_POWER_OFF_IN_SLEEP
+  M5.disableEPDPower();
+  #endif
+  #if EXTPWR_OFF_IN_SLEEP
+  M5.disableEXTPower();
+  #endif
+  clampAndLogRefresh();
+  uint64_t armUs2 = (uint64_t)refreshIntervalSeconds * 1000000ULL;
+  Serial.printf("Re-arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs2);
+  esp_sleep_enable_timer_wakeup(armUs2);
+  bool extArmed2 = armExt0IfIdle();
+  Serial.printf("EXT0 armed=%s\n", extArmed2 ? "yes" : "no");
+  WiFi.mode(WIFI_OFF);
+  lastSleepMs = millis();
+  esp_light_sleep_start();
+}
+
+static bool armExt0IfIdle() {
+  // Only arm EXT0 if touch reports finger up (INT not asserted)
+  if (ext0CooldownUntilMs && millis() < ext0CooldownUntilMs) {
+    return false;
+  }
+  M5.TP.update();
+  if (!M5.TP.isFingerUp()) return false;
+  esp_sleep_enable_ext0_wakeup(TOUCH_INT_PIN, 0);
+  return true;
 }
 
 // Simple two-line word wrap for titles: splits near middle at space
@@ -134,6 +223,25 @@ void drawUI() {
 
   // Spacer
   y += 8;
+
+  // Debug clock (top-left)
+  if (SHOW_DEBUG_CLOCK) {
+    time_t nowSecs = time(nullptr);
+    if (tzOffsetMinutes != 0) nowSecs += tzOffsetMinutes * 60;
+    struct tm tinfo;
+    gmtime_r(&nowSecs, &tinfo);
+    char buf[9];
+    if (TWENTYFOUR_HOUR) {
+      snprintf(buf, sizeof(buf), "%02d:%02d", tinfo.tm_hour, tinfo.tm_min);
+    } else {
+      int hour12 = tinfo.tm_hour % 12; if (hour12 == 0) hour12 = 12;
+      const char* ampm = (tinfo.tm_hour < 12) ? "AM" : "PM";
+      snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, tinfo.tm_min, ampm);
+    }
+    canvas.setTextDatum(TL_DATUM);
+    if (hasTTFFonts) { useTTF(FONT_REGULAR_PATH, 28); } else { canvas.setTextFont(1); canvas.setTextSize(3); }
+    canvas.drawString(buf, margin, 20);
+  }
 
   // Battery indicator (top-right)
   if (SHOW_BATTERY) {
@@ -285,7 +393,7 @@ void drawUI() {
       if (firstAction.length() == 0) firstAction = "End Early"; else secondAction = "End Early";
     }
   } else {
-    if (canInstantReserve) firstAction = "Reserve 15 min";
+    if (canInstantReserve) firstAction = "Reserve";
   }
 
   if (firstAction.length() > 0 && secondAction.length() == 0) {
@@ -314,6 +422,15 @@ static bool connectWiFi() {
     delay(200);
   }
   wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected && !timeSynced) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    unsigned long start = millis();
+    time_t now = 0;
+    while ((now = time(nullptr)) < 1609459200 && millis() - start < 5000) { // wait up to ~5s
+      delay(200);
+    }
+    timeSynced = (now >= 1609459200);
+  }
   return wifiConnected;
 }
 
@@ -331,6 +448,7 @@ static bool fetchSchedule() {
   // Snapshot and clear action immediately to avoid accidental repeats
   int actionParam = g_action;
   g_action = 0;
+  updateVoltageString();
   String url = String(SCHEDULE_API_BASE) + "/eink/" + displayKey + "?action=" + String(actionParam) + "&voltage=" + voltstr;
   Serial.println(url);
   if (!http.begin(client, url)) { disconnectWiFi(); return false; }
@@ -360,6 +478,9 @@ static bool fetchSchedule() {
   canEndMeeting       = doc["canEndMeeting"].as<int>();
   canInstantReserve   = doc["canInstantReserve"].as<int>();
   occupied            = doc["occupied"].as<int>();
+  if (doc.containsKey("timezone")) {
+    tzOffsetMinutes = doc["timezone"].as<int>() * 60; // hours to minutes
+  }
   // action already cleared above
 
   return true;
@@ -448,21 +569,56 @@ void setup() {
   delay(2000);
 
   // Switch to light sleep with TP INT wake to allow touch any time
-  esp_sleep_enable_timer_wakeup((uint64_t)refreshIntervalSeconds * 1000000ULL);
-  esp_sleep_enable_ext0_wakeup(TOUCH_INT_PIN, 0); // TP INT, active low
+  #if EPD_POWER_OFF_IN_SLEEP
+  M5.disableEPDPower();
+  #endif
+  #if EXTPWR_OFF_IN_SLEEP
+  M5.disableEXTPower();
+  #endif
+  clampAndLogRefresh();
+  uint64_t armUs = (uint64_t)refreshIntervalSeconds * 1000000ULL;
+  Serial.printf("Arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs);
+  esp_sleep_enable_timer_wakeup(armUs);
+  bool extArmed = armExt0IfIdle();
+  Serial.printf("EXT0 armed=%s\n", extArmed ? "yes" : "no");
   // Touch is initialized by M5.begin when touch is enabled; just set rotation
   M5.TP.SetRotation(SCREEN_ROTATION);
+  WiFi.mode(WIFI_OFF);
+  lastSleepMs = millis();
   Serial.println("Entering light sleep");
   esp_light_sleep_start();
 }
 
 void loop() {
+  logWakeCause();
+  // On wake: re-enable any power rails we disabled before sleep
+  #if EPD_POWER_OFF_IN_SLEEP
+  M5.enableEPDPower();
+  #endif
+  #if EXTPWR_OFF_IN_SLEEP
+  M5.enableEXTPower();
+  #endif
+  delay(10); // allow rails to stabilize
+  // If this was a timer wake, refresh data and UI immediately
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    Serial.println("Timer wake: refreshing schedule and UI");
+    updateVoltageString();
+    if (!fetchSchedule()) {
+      Serial.println("Timer fetch failed; keeping previous UI");
+    }
+    drawUI();
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    delay(100);
+    rearmAndSleep();
+    return;
+  }
   // After light sleep wake: poll touch briefly, handle action tap, refresh, and go back to sleep
   tp_finger_t finger;
   bool touched = M5.TP.available();
   if (millis() < touchCooldownUntilMs) {
     // Skip processing touches during cooldown to avoid double actions
-    goto sleep_again;
+    rearmAndSleep();
+    return;
   }
   if (touched) {
     M5.TP.update();
@@ -486,7 +642,7 @@ void loop() {
           if (firstAction.length() == 0) firstAction = "End Early"; else secondAction = "End Early";
         }
       } else {
-        if (canInstantReserve) firstAction = "Reserve 15 min";
+        if (canInstantReserve) firstAction = "Reserve";
       }
 
       bool didAction = false;
@@ -496,7 +652,7 @@ void loop() {
           // Press feedback: darker bar + working text, fast update
           drawActionBarPressed(margin, singleY, contentWidth, actionsH, firstAction.c_str());
           canvas.pushCanvas(0, 0, UPDATE_MODE_A2);
-          if (firstAction == "Reserve 15 min") didAction = postReserve15();
+          if (firstAction == "Reserve") didAction = postReserve15();
           else if (firstAction == "Extend") didAction = postExtend();
           else if (firstAction == "End Early") didAction = postEndEarly();
         }
@@ -504,7 +660,7 @@ void loop() {
         if (firstAction.length() > 0 && inRect(margin, actionsYTop, contentWidth, actionsH)) {
           drawActionBarPressed(margin, actionsYTop, contentWidth, actionsH, firstAction.c_str());
           canvas.pushCanvas(0, 0, UPDATE_MODE_A2);
-          if (firstAction == "Reserve 15 min") didAction = postReserve15();
+          if (firstAction == "Reserve") didAction = postReserve15();
           else if (firstAction == "Extend") didAction = postExtend();
           else if (firstAction == "End Early") didAction = postEndEarly();
         }
@@ -534,10 +690,7 @@ void loop() {
   }
 
   // Re-arm sleep quickly to save power
-sleep_again:
-  esp_sleep_enable_timer_wakeup((uint64_t)refreshIntervalSeconds * 1000000ULL);
-  esp_sleep_enable_ext0_wakeup(TOUCH_INT_PIN, 0);
-  esp_light_sleep_start();
+  rearmAndSleep();
 }
 
 

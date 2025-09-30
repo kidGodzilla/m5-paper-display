@@ -70,6 +70,24 @@
 #ifndef SHOW_BATTERY
 #define SHOW_BATTERY 1 // set 0 to hide battery indicator
 #endif
+
+// Debug clock (small HH:MM at top-left)
+#ifndef SHOW_DEBUG_CLOCK
+#define SHOW_DEBUG_CLOCK 1 // set 1 to show a small clock for debugging
+#endif
+
+// Time format: 24-hour (1) or 12-hour with AM/PM (0)
+#ifndef TWENTYFOUR_HOUR
+#define TWENTYFOUR_HOUR 1
+#endif
+
+// Power optimization toggles
+#ifndef EPD_POWER_OFF_IN_SLEEP
+#define EPD_POWER_OFF_IN_SLEEP 1 // disable EPD power during light sleep, re-enable on wake
+#endif
+#ifndef EXTPWR_OFF_IN_SLEEP
+#define EXTPWR_OFF_IN_SLEEP 0 // usually keep EXTPower on so touch stays powered
+#endif
 // Optional TTF font paths on SD (root). If absent, built-in fonts are used
 #ifndef FONT_REGULAR_PATH
 #define FONT_REGULAR_PATH "/FreeSans.ttf"
