@@ -50,14 +50,32 @@ static String wifiPwStr   = WIFI_PW;
 static bool timeSynced = false;
 static int tzOffsetMinutes = 0; // from API 'timezone' (hours) * 60
 static unsigned long lastSleepMs = 0;
+static unsigned long lastNtpSyncMs = 0; // Track when we last synced NTP
 static uint32_t consecutiveTimerWakeMisses = 0;
 static uint32_t consecutiveExt0Bounces = 0;
 static unsigned long ext0CooldownUntilMs = 0;
+
+// Business hours configuration (loaded from Config.h or SD config.json)
+static bool enableBusinessHours = ENABLE_BUSINESS_HOURS;
+static int businessHoursStart = BUSINESS_HOURS_START;
+static int businessHoursEnd = BUSINESS_HOURS_END;
+static bool deepSleepWeekends = DEEP_SLEEP_WEEKENDS;
+
+// Temporary wake mode (button press during deep sleep)
+static bool inTemporaryWakeMode = false;
+static unsigned long temporaryWakeStartMs = 0;
+static const unsigned long TEMPORARY_WAKE_DURATION_MS = 30000; // 30 seconds to interact
 
 M5EPD_Canvas canvas(&M5.EPD);
 
 // Optional TrueType fonts from SD card (paths defined in Config.h)
 static bool hasTTFFonts = false;
+
+// Optional logo from SD card
+static bool hasLogo = false;
+static bool logoIsJpg = false;
+static int logoWidth = 0;
+static int logoHeight = 0;
 
 static void useTTF(const char* path, int pixelSize) {
   if (!hasTTFFonts) return;
@@ -72,6 +90,93 @@ static void updateVoltageString() {
   if (mv < 300) mv = 0; // guard weird reads
   float v = mv / 1000.0f;
   voltstr = String(v, 2);
+}
+
+// Check if current time is within business hours (or temporary wake mode)
+static bool isWithinBusinessHours() {
+  // Temporary wake mode overrides business hours check
+  if (inTemporaryWakeMode) return true;
+  
+  if (!enableBusinessHours) return true; // feature disabled, always active
+  if (!timeSynced) return true; // if time not synced, assume business hours (stay active)
+  
+  time_t nowSecs = time(nullptr);
+  struct tm utcInfo;
+  gmtime_r(&nowSecs, &utcInfo);
+  
+  // Apply timezone offset to get LOCAL time
+  time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+  struct tm localInfo;
+  gmtime_r(&localSecs, &localInfo);
+  
+  int hour = localInfo.tm_hour;
+  int wday = localInfo.tm_wday; // 0=Sunday, 6=Saturday
+  
+  LOG("Business hours check: UTC=%02d:%02d, Local=%02d:%02d (tz offset=%d min)\n",
+      utcInfo.tm_hour, utcInfo.tm_min, localInfo.tm_hour, localInfo.tm_min, tzOffsetMinutes);
+  
+  // Check weekend
+  if (deepSleepWeekends && (wday == 0 || wday == 6)) {
+    LOG("Outside business hours: Weekend (local day=%d)\n", wday);
+    return false;
+  }
+  
+  // Check hour range (business hours are in LOCAL time)
+  if (hour < businessHoursStart || hour >= businessHoursEnd) {
+    LOG("Outside business hours: local hour=%d (range: %d-%d)\n", hour, businessHoursStart, businessHoursEnd);
+    return false;
+  }
+  
+  LOG("Within business hours: local hour=%d\n", hour);
+  return true;
+}
+
+// Calculate seconds until next business hours start
+static uint64_t secondsUntilBusinessHours() {
+  time_t nowSecs = time(nullptr);
+  // Apply timezone offset to get LOCAL time
+  time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+  struct tm tinfo;
+  gmtime_r(&localSecs, &tinfo);
+  
+  int currentHour = tinfo.tm_hour;
+  int currentMin = tinfo.tm_min;
+  int currentSec = tinfo.tm_sec;
+  int wday = tinfo.tm_wday; // 0=Sunday, 6=Saturday
+  
+  // Calculate seconds since midnight today
+  uint64_t secondsSinceMidnight = currentHour * 3600ULL + currentMin * 60ULL + currentSec;
+  
+  // If it's weekend, sleep until Monday start time
+  if (deepSleepWeekends && (wday == 0 || wday == 6)) {
+    int daysUntilMonday = (wday == 0) ? 1 : 2; // Sunday->1day, Saturday->2days
+    uint64_t sleepSecs = (daysUntilMonday * 86400ULL) - secondsSinceMidnight + (businessHoursStart * 3600ULL);
+    LOG("Weekend: sleeping %llu seconds until Monday %d:00\n", sleepSecs, businessHoursStart);
+    return sleepSecs;
+  }
+  
+  // If before business hours today, sleep until start time
+  if (currentHour < businessHoursStart) {
+    uint64_t sleepSecs = (businessHoursStart * 3600ULL) - secondsSinceMidnight;
+    LOG("Before hours: sleeping %llu seconds until %d:00\n", sleepSecs, businessHoursStart);
+    return sleepSecs;
+  }
+  
+  // Otherwise, after hours today - sleep until tomorrow's start time
+  uint64_t secondsUntilMidnight = 86400ULL - secondsSinceMidnight;
+  uint64_t sleepSecs = secondsUntilMidnight + (businessHoursStart * 3600ULL);
+  
+  // But if tomorrow is weekend and we deep sleep weekends, extend to Monday
+  int tomorrowWday = (wday + 1) % 7;
+  if (deepSleepWeekends && (tomorrowWday == 0 || tomorrowWday == 6)) {
+    int daysUntilMonday = (tomorrowWday == 6) ? 2 : 1; // Sat->2, Sun->1
+    sleepSecs += (daysUntilMonday - 1) * 86400ULL;
+    LOG("After hours (weekend ahead): sleeping %llu seconds until Monday %d:00\n", sleepSecs, businessHoursStart);
+  } else {
+    LOG("After hours: sleeping %llu seconds until tomorrow %d:00\n", sleepSecs, businessHoursStart);
+  }
+  
+  return sleepSecs;
 }
 
 static void clampAndLogRefresh() {
@@ -122,6 +227,40 @@ static void logWakeCause() {
 }
 
 static void rearmAndSleep() {
+  // Check if we're outside business hours - if so, deep sleep until next business day
+  if (!isWithinBusinessHours()) {
+    uint64_t deepSleepSeconds = secondsUntilBusinessHours();
+    uint64_t deepSleepUs = deepSleepSeconds * 1000000ULL;
+    
+    // Cap deep sleep to prevent overflow (max ~48 days)
+    if (deepSleepUs > 0xFFFFFFFFFFFFULL) {
+      deepSleepUs = 86400ULL * 1000000ULL; // fallback: 1 day
+    }
+    
+    Serial.printf("Deep sleeping outside business hours for %llu seconds\n", deepSleepSeconds);
+    Serial.println("Disabling power rails...");
+    M5.disableEPDPower();
+    // Keep EXTPower enabled so buttons can wake the device
+    // M5.disableEXTPower(); // Commented out - buttons need power
+    WiFi.mode(WIFI_OFF);
+    
+    // Arm timer wake for next business hours
+    esp_sleep_enable_timer_wakeup(deepSleepUs);
+    Serial.printf("Timer wake armed for %llu seconds\n", deepSleepSeconds);
+    
+    // Arm physical button wake (G37, G38, G39) so user can check schedule
+    uint64_t buttonMask = (1ULL << GPIO_NUM_37) | (1ULL << GPIO_NUM_38) | (1ULL << GPIO_NUM_39);
+    esp_err_t err = esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
+    Serial.println("Entering deep sleep NOW");
+    Serial.flush();
+    
+    delay(200);
+    esp_deep_sleep_start();
+    // Device will reboot on wake
+  }
+  
+  // Normal light sleep during business hours
   #if EPD_POWER_OFF_IN_SLEEP
   M5.disableEPDPower();
   #endif
@@ -185,14 +324,15 @@ void drawActionBar(int x, int y, int w, int h, const char* label) {
   const int r = 2; // subtle corners
   // very light grey fill (close to white)
   canvas.fillRoundRect(x, y, w, h, r, BUTTON_FILL_SHADE);
-  canvas.setTextDatum(ML_DATUM);
+  canvas.setTextDatum(MC_DATUM); // Middle-Center alignment
   if (hasTTFFonts) {
     useTTF(FONT_BOLD_PATH, 44);
   } else {
     canvas.setTextFont(2);
     canvas.setTextSize(5);
   }
-  canvas.drawString(label, x + 24, y + h / 2 + 1);
+  // Center text in button (with 2px down adjustment for visual alignment)
+  canvas.drawString(label, x + w / 2, y + h / 2 + 2);
   canvas.setTextDatum(TL_DATUM);
 }
 
@@ -201,7 +341,7 @@ void drawActionBarPressed(int x, int y, int w, int h, const char* label) {
   const int r = 2;
   // Slightly darker bar to indicate press
   canvas.fillRoundRect(x, y, w, h, r, BUTTON_PRESSED_SHADE);
-  canvas.setTextDatum(ML_DATUM);
+  canvas.setTextDatum(MC_DATUM); // Middle-Center alignment
   if (hasTTFFonts) {
     useTTF(FONT_BOLD_PATH, 44);
   } else {
@@ -211,7 +351,8 @@ void drawActionBarPressed(int x, int y, int w, int h, const char* label) {
   // Draw label in white on dark bar
   uint8_t prevColor = 14;
   canvas.setTextColor(0);
-  canvas.drawString(label, x + 24, y + h / 2 + 1);
+  // Center text in button (with 2px down adjustment for visual alignment)
+  canvas.drawString(label, x + w / 2, y + h / 2 + 2);
   canvas.setTextColor(prevColor);
   canvas.setTextDatum(TL_DATUM);
 }
@@ -227,13 +368,7 @@ void drawUI() {
   const int margin = 24;
   const int contentWidth = PORTRAIT_WIDTH - margin * 2;
 
-  // Top spacing
-  int y = 72;
-
-  // Spacer
-  y += 8;
-
-  // Debug clock (top-left)
+  // Debug clock (top-left) - drawn first at fixed position
   if (SHOW_DEBUG_CLOCK) {
     time_t nowSecs = time(nullptr);
     LOG("[drawUI] Debug clock: rawTime=%lu tzOffsetMin=%d\n", (unsigned long)nowSecs, tzOffsetMinutes);
@@ -254,7 +389,7 @@ void drawUI() {
     canvas.drawString(buf, margin, 20);
   }
 
-  // Battery indicator (top-right)
+  // Battery indicator (top-right) - drawn at fixed position
   if (SHOW_BATTERY) {
     // Read battery voltage and map to percent (3300-4350mV)
     uint32_t mv = M5.getBatteryVoltage();
@@ -263,7 +398,7 @@ void drawUI() {
     if (pct < 0) pct = 0; if (pct > 100) pct = 100;
 
     int bx = PORTRAIT_WIDTH - 24 - 80; // right margin 24, width ~80
-    int by = 24;                        // top margin
+    int by = 14;                        // top margin (moved up for vertical centering with clock)
     int bw = 80;
     int bh = 28;
     int capW = 6;
@@ -277,22 +412,40 @@ void drawUI() {
     canvas.fillRect(bx + 3, by + 3, fillW, innerH, TEXT_COLOR_SHADE);
   }
 
+  // Start main content layout - position everything below debug clock/battery
+  int y = 70; // Start below debug area (moved down 10px for logo)
+
+  // Optional logo at top (moves everything down if present)
+  if (hasLogo && logoHeight > 0) {
+    // Draw the logo (return value is unreliable, may be non-zero even on success)
+    if (logoIsJpg) {
+      canvas.drawJpgFile(SD, "/logo.jpg", margin, y);
+      LOG("[drawUI] Drew JPG logo\n");
+    } else {
+      canvas.drawPngFile(SD, "/logo.png", margin, y);
+      LOG("[drawUI] Drew PNG logo\n");
+    }
+    // Always add logo spacing if hasLogo is true (logo was detected during setup)
+    y += logoHeight + 80; // logo height + generous spacing before room name
+  } else {
+    // No logo: add standard spacing
+    y += 20;
+  }
+
   // Room name (large, left-aligned, bigger scale)
-  y += 8;
-  canvas.setTextDatum(ML_DATUM);
+  canvas.setTextDatum(ML_DATUM); // Middle-Left alignment (revert to original)
   if (hasTTFFonts) {
-    useTTF(FONT_BOLD_PATH, 68); // slightly reduced
+    useTTF(FONT_BOLD_PATH, 68);
   } else {
     canvas.setTextFont(2);
     canvas.setTextSize(6);
   }
-  canvas.drawString(roomName.c_str(), margin, y);
+  canvas.drawString(roomName.c_str(), margin, y); // left-aligned with other text
   canvas.setTextDatum(TL_DATUM);
 
   // Current meeting block (prominent)
-  // Current meeting (text-first, generous spacing)
-  y += 88; // more spacing before Now
-  canvas.setTextDatum(ML_DATUM);
+  y += 86; // spacing after room name (decreased by 2px)
+  canvas.setTextDatum(ML_DATUM); // Middle-Left alignment (revert to original)
   if (hasTTFFonts) {
     useTTF(FONT_REGULAR_PATH, 36);
   } else {
@@ -300,7 +453,7 @@ void drawUI() {
     canvas.setTextSize(4);
   }
   canvas.drawString("Now", margin, y);
-  y += 68;
+  y += 68; // spacing after "Now"
   if (hasTTFFonts) {
     useTTF(FONT_BOLD_PATH, 64); // current meeting title size
   } else {
@@ -318,25 +471,36 @@ void drawUI() {
       }
     }
 
-    // Approximate width-based wrap at current title font size (64px)
+    // Multi-line word wrap for meeting title (supports 3+ lines)
     const float approxCharWidth = 0.56f; // FreeSans ~0.56 * px
     const float fontPx = 64.0f;
     int maxChars = (int)((float)contentWidth / (fontPx * approxCharWidth));
     if (maxChars < 8) maxChars = 8;
+    const int lineSpacing = 69; // spacing between wrapped lines
 
-    if ((int)subject.length() > maxChars) {
-      int split = subject.lastIndexOf(' ', maxChars);
-      if (split < 0) split = maxChars;
-      String line1 = subject.substring(0, split);
-      String line2 = subject.substring(split + 1);
-      canvas.drawString(line1.c_str(), margin, y);
-      y += 66;
-      canvas.drawString(line2.c_str(), margin, y);
+    String remaining = subject;
+    bool firstLine = true;
+    while (remaining.length() > 0) {
+      if (!firstLine) {
+        y += lineSpacing;
+      }
+      
+      if ((int)remaining.length() <= maxChars) {
+        // Last line fits completely
+        canvas.drawString(remaining.c_str(), margin - 1, y);
+        break;
     } else {
-      canvas.drawString(subject.c_str(), margin, y);
+        // Need to wrap: find word boundary
+        int split = remaining.lastIndexOf(' ', maxChars);
+        if (split < 0) split = maxChars; // Hard split if no space found
+        String line = remaining.substring(0, split);
+        canvas.drawString(line.c_str(), margin - 1, y);
+        remaining = remaining.substring(split + 1); // +1 to skip the space
+        firstLine = false;
+      }
     }
   }
-  y += 64;
+  y += 67; // increased from 64 to add 3px more space before time
   if (hasTTFFonts) {
     useTTF(FONT_REGULAR_PATH, 40);
   } else {
@@ -346,9 +510,9 @@ void drawUI() {
   canvas.drawString(currentMeetingTime.c_str(), margin, y);
   canvas.setTextDatum(TL_DATUM);
 
-  // Next meeting block (outlined)
-  y += 96; // more spacing before Next
-  canvas.setTextDatum(ML_DATUM);
+  // Next meeting block
+  y += 96; // spacing before Next
+  canvas.setTextDatum(ML_DATUM); // Middle-Left alignment (revert to original)
   if (hasTTFFonts) {
     useTTF(FONT_REGULAR_PATH, 36);
   } else {
@@ -356,7 +520,7 @@ void drawUI() {
     canvas.setTextSize(4);
   }
   canvas.drawString(nextMeetingLabel.c_str(), margin, y);
-  y += 59;
+  y += 59; // spacing after "Next"
   if (hasTTFFonts) {
     useTTF(FONT_BOLD_PATH, 44);
   } else {
@@ -380,7 +544,7 @@ void drawUI() {
       canvas.drawString(nextMeetingTitle.c_str(), margin, y);
     }
   }
-  y += 56;
+  y += 56; // spacing after next meeting title
   if (hasTTFFonts) {
     useTTF(FONT_REGULAR_PATH, 40);
   } else {
@@ -388,12 +552,12 @@ void drawUI() {
     canvas.setTextSize(4);
   }
   canvas.drawString(nextMeetingTime.c_str(), margin, y);
-  canvas.setTextDatum(TL_DATUM);
 
-  // Actions area at bottom
-  // Actions: two full-width bars at bottom
+  // Actions area at bottom (only show buttons if within business hours - touch is active)
+  if (isWithinBusinessHours()) {
   int actionsH = 108;
-  int actionsY = PORTRAIT_HEIGHT - actionsH * 2 - 64;
+    int buttonGap = 12; // gap between two buttons
+    int bottomMargin = margin; // match left/right margin (24px)
 
   // Decide actions based on flags
   String firstAction = "";
@@ -404,19 +568,56 @@ void drawUI() {
       if (firstAction.length() == 0) firstAction = "End Early"; else secondAction = "End Early";
     }
   } else {
-    if (canInstantReserve) firstAction = "Reserve";
+      if (canInstantReserve) firstAction = "Reserve";
   }
 
   if (firstAction.length() > 0 && secondAction.length() == 0) {
-    int singleY = PORTRAIT_HEIGHT - actionsH - 24; // pin to bottom
+      // Single button: full-width at bottom
+      int singleY = PORTRAIT_HEIGHT - actionsH - bottomMargin;
     drawActionBar(margin, singleY, contentWidth, actionsH, firstAction.c_str());
+    } else if (firstAction.length() > 0 && secondAction.length() > 0) {
+      // Two buttons: side-by-side at bottom
+      int buttonY = PORTRAIT_HEIGHT - actionsH - bottomMargin;
+      int buttonWidth = (contentWidth - buttonGap) / 2;
+      drawActionBar(margin, buttonY, buttonWidth, actionsH, firstAction.c_str());
+      drawActionBar(margin + buttonWidth + buttonGap, buttonY, buttonWidth, actionsH, secondAction.c_str());
+    }
   } else {
-    if (firstAction.length() > 0) {
-      drawActionBar(margin, actionsY, contentWidth, actionsH, firstAction.c_str());
+    // Outside business hours: show sleep message instead of buttons
+    int messageY = PORTRAIT_HEIGHT - 100; // Position in button area
+    canvas.setTextDatum(TC_DATUM); // Top-Center alignment
+    if (hasTTFFonts) {
+      useTTF(FONT_REGULAR_PATH, 28);
+    } else {
+      canvas.setTextFont(1);
+      canvas.setTextSize(3);
     }
-    if (secondAction.length() > 0) {
-      drawActionBar(margin, actionsY + actionsH + 20, contentWidth, actionsH, secondAction.c_str());
+    canvas.drawString("Device is sleeping.", PORTRAIT_WIDTH / 2, messageY);
+    messageY += 36;
+    
+    // Calculate and show next wake time
+    time_t nowSecs = time(nullptr);
+    time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+    struct tm localInfo;
+    gmtime_r(&localSecs, &localInfo);
+    
+    String nextUpdate = "Next update: ";
+    if (deepSleepWeekends && (localInfo.tm_wday == 0 || localInfo.tm_wday == 6)) {
+      nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+    } else if (localInfo.tm_hour >= businessHoursEnd) {
+      // After hours - wake tomorrow
+      if (deepSleepWeekends && ((localInfo.tm_wday + 1) % 7 == 0 || (localInfo.tm_wday + 1) % 7 == 6)) {
+        nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+      } else {
+        nextUpdate += "Tomorrow " + String(businessHoursStart) + ":00";
+      }
+    } else {
+      // Before hours - wake today
+      nextUpdate += "Today " + String(businessHoursStart) + ":00";
     }
+    
+    canvas.drawString(nextUpdate.c_str(), PORTRAIT_WIDTH / 2, messageY);
+    canvas.setTextDatum(TL_DATUM);
   }
 }
 
@@ -441,7 +642,8 @@ static bool connectWiFi() {
     Serial.printf("ERROR: Wi-Fi connect failed status=%d\n", (int)WiFi.status());
     return false;
   }
-  if (wifiConnected && !timeSynced) {
+  // Only sync NTP if we haven't synced yet, or it's been more than 24 hours
+  if (wifiConnected && (!timeSynced || (millis() - lastNtpSyncMs > 86400000UL))) {
     LOG("[connectWiFi] Syncing NTP...\n");
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     unsigned long ntpStart = millis();
@@ -450,7 +652,10 @@ static bool connectWiFi() {
       delay(200);
     }
     timeSynced = (now >= 1609459200);
+    if (timeSynced) lastNtpSyncMs = millis();
     LOG("[connectWiFi] NTP sync %s (took %lums, now=%lu)\n", timeSynced ? "OK" : "TIMEOUT", millis() - ntpStart, (unsigned long)now);
+  } else if (timeSynced) {
+    LOG("[connectWiFi] Skipping NTP (last sync %lu ms ago)\n", millis() - lastNtpSyncMs);
   }
   return wifiConnected;
 }
@@ -470,7 +675,9 @@ static bool fetchSchedule() {
   LOG("[fetchSchedule] Wi-Fi connected, building HTTP request\n");
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(8); // 8 second timeout (default is 30s)
   HTTPClient http;
+  http.setTimeout(8000); // 8 second timeout
   // Snapshot and clear action immediately to avoid accidental repeats
   int actionParam = g_action;
   g_action = 0;
@@ -483,8 +690,9 @@ static bool fetchSchedule() {
     return false;
   }
   LOG("[fetchSchedule] Sending GET request...\n");
+  unsigned long httpStart = millis();
   int code = http.GET();
-  LOG("[fetchSchedule] HTTP response code=%d\n", code);
+  LOG("[fetchSchedule] HTTP response code=%d (took %lums)\n", code, millis() - httpStart);
   if (code != HTTP_CODE_OK) {
     Serial.printf("ERROR: fetchSchedule: HTTP GET failed code=%d (%s)\n", code, http.errorToString(code).c_str());
     http.end();
@@ -523,6 +731,26 @@ static bool fetchSchedule() {
   if (doc.containsKey("timezone")) {
     tzOffsetMinutes = doc["timezone"].as<int>() * 60; // hours to minutes
   }
+  
+  // Use API timestamp as fallback if NTP failed or isn't synced
+  if (doc.containsKey("timestamp")) {
+    unsigned long apiTimestamp = doc["timestamp"].as<unsigned long>();
+    if (apiTimestamp > 1609459200) { // sanity check (after Jan 1, 2021)
+      // Set system time from API if NTP hasn't synced
+      if (!timeSynced) {
+        struct timeval tv;
+        tv.tv_sec = apiTimestamp;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+        timeSynced = true;
+        lastNtpSyncMs = millis();
+        LOG("[fetchSchedule] Time synced from API timestamp: %lu\n", apiTimestamp);
+      } else {
+        LOG("[fetchSchedule] API timestamp received: %lu (already synced via NTP)\n", apiTimestamp);
+      }
+    }
+  }
+  
   // action already cleared above
   LOG("[fetchSchedule] SUCCESS: room=%s occupied=%d canExtend=%d canEndMeeting=%d canInstantReserve=%d\n",
       roomName.c_str(), occupied, canExtend, canEndMeeting, canInstantReserve);
@@ -571,6 +799,10 @@ void setup() {
           const char* pw   = cfg["wifi_password"] | WIFI_PW;
           const char* key  = cfg["display_key"] | ROOM_ID;
           int refresh      = cfg["refresh_seconds"] | (int)REFRESH_SECONDS;
+          int enableBiz    = cfg["enable_business_hours"] | (int)ENABLE_BUSINESS_HOURS;
+          int bizStart     = cfg["business_hours_start"] | BUSINESS_HOURS_START;
+          int bizEnd       = cfg["business_hours_end"] | BUSINESS_HOURS_END;
+          int sleepWeekend = cfg["deep_sleep_weekends"] | (int)DEEP_SLEEP_WEEKENDS;
           displayKey = String(key);
           roomName   = displayKey; // until API loads real name
           // Override Wi-Fi creds used by connectWiFi
@@ -578,7 +810,13 @@ void setup() {
           wifiPwStr   = String(pw);
           // Update refresh interval
           refreshIntervalSeconds = (uint32_t)refresh;
+          // Update business hours
+          enableBusinessHours = (enableBiz != 0);
+          businessHoursStart = bizStart;
+          businessHoursEnd = bizEnd;
+          deepSleepWeekends = (sleepWeekend != 0);
           Serial.println("Loaded SD config.json");
+          LOG("Business hours: %s, %d:00 - %d:00, weekends=%s\n", enableBusinessHours ? "enabled" : "disabled", businessHoursStart, businessHoursEnd, deepSleepWeekends ? "sleep" : "active");
         } else {
           Serial.println("ERROR: Failed to parse config.json");
         }
@@ -592,6 +830,35 @@ void setup() {
     LOG("TTF fonts found on SD\n");
   } else {
     LOG("TTF fonts not found; using built-ins\n");
+  }
+
+  // Detect logo on SD (optional) - try PNG first, then JPG
+  if (SD.exists("/logo.png")) {
+    File logoFile = SD.open("/logo.png", FILE_READ);
+    if (logoFile && logoFile.size() > 0) {
+      hasLogo = true;
+      logoIsJpg = false;
+      logoHeight = 60; // Fixed max height for logo (adjustable in Config.h if needed)
+      LOG("Logo PNG found on SD (file size: %d bytes, max height: %dpx)\n", logoFile.size(), logoHeight);
+      logoFile.close();
+    } else {
+      Serial.println("ERROR: logo.png found but could not open or is empty");
+      if (logoFile) logoFile.close();
+    }
+  } else if (SD.exists("/logo.jpg")) {
+    File logoFile = SD.open("/logo.jpg", FILE_READ);
+    if (logoFile && logoFile.size() > 0) {
+      hasLogo = true;
+      logoIsJpg = true;
+      logoHeight = 60; // Fixed max height for logo
+      LOG("Logo JPG found on SD (file size: %d bytes, max height: %dpx)\n", logoFile.size(), logoHeight);
+      logoFile.close();
+    } else {
+      Serial.println("ERROR: logo.jpg found but could not open or is empty");
+      if (logoFile) logoFile.close();
+    }
+  } else {
+    LOG("No logo.png or logo.jpg found on SD\n");
   }
 
   // Default placeholders when offline
@@ -635,6 +902,8 @@ void setup() {
 
 void loop() {
   logWakeCause();
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  
   // On wake: re-enable any power rails we disabled before sleep
   #if EPD_POWER_OFF_IN_SLEEP
   M5.enableEPDPower();
@@ -643,10 +912,32 @@ void loop() {
   M5.enableEXTPower();
   #endif
   delay(10); // allow rails to stabilize
+  
+  // If button wake during deep sleep (outside business hours), enter temporary wake mode
+  if (wakeupCause == ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.println("[loop] BUTTON wake during deep sleep: entering temporary wake mode (30s)");
+    inTemporaryWakeMode = true;
+    temporaryWakeStartMs = millis();
+    
+    // Initialize touch panel for temporary wake mode
+    M5.TP.SetRotation(SCREEN_ROTATION);
+    Serial.println("[loop] Touch panel initialized for temporary wake");
+    
+    updateVoltageString();
+    if (!fetchSchedule()) {
+      Serial.println("[loop] fetchSchedule FAILED; keeping previous UI");
+    }
+    drawUI(); // Will show buttons because inTemporaryWakeMode = true
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    delay(2500); // Allow e-ink refresh to complete
+    Serial.println("[loop] Temporary wake mode active - touch enabled for 30s");
+    // Fall through to normal touch handling loop below
+  }
+  
   // If this was a timer wake, refresh data and UI immediately
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+  if (wakeupCause == ESP_SLEEP_WAKEUP_TIMER) {
     LOG("[loop] TIMER wake: refreshing schedule and UI\n");
-    timeSynced = false; // force NTP re-sync on next Wi-Fi connect
+    // Note: NTP will auto-sync if it's been >24h since last sync
     updateVoltageString();
     LOG("[loop] Voltage updated: %s\n", voltstr.c_str());
     if (!fetchSchedule()) {
@@ -664,7 +955,36 @@ void loop() {
     rearmAndSleep();
     return;
   }
-  // After light sleep wake: poll touch briefly, handle action tap, refresh, and go back to sleep
+  // Check if temporary wake mode has expired
+  if (inTemporaryWakeMode && (millis() - temporaryWakeStartMs > TEMPORARY_WAKE_DURATION_MS)) {
+    Serial.println("[loop] Temporary wake mode expired, returning to deep sleep");
+    inTemporaryWakeMode = false;
+    rearmAndSleep(); // Will deep sleep again (outside business hours)
+    return;
+  }
+  
+  // In temporary wake mode: stay awake and poll for touches continuously
+  if (inTemporaryWakeMode) {
+    tp_finger_t finger;
+    bool touched = M5.TP.available();
+    if (millis() < touchCooldownUntilMs) {
+      delay(100); // Wait during cooldown
+      return; // Loop again
+    }
+    if (!touched) {
+      delay(100); // Poll every 100ms
+      return; // Loop again to check for timeout or touch
+    }
+    // Touch detected - process it
+    M5.TP.update();
+    if (M5.TP.isFingerUp()) {
+      delay(100);
+      return; // Loop again
+    }
+    // Finger is down, process touch (fall through to touch handling below)
+  }
+  
+  // After light sleep wake: poll touch briefly, handle action tap
   tp_finger_t finger;
   bool touched = M5.TP.available();
   if (millis() < touchCooldownUntilMs) {
@@ -678,12 +998,12 @@ void loop() {
       finger = M5.TP.readFinger(0);
       int x = finger.x;
       int y = finger.y;
-      // Determine action areas
+      // Determine action areas (must match drawUI calculations)
       const int margin = 24;
       const int contentWidth = PORTRAIT_WIDTH - margin * 2;
       const int actionsH = 108;
-      int actionsYTop = PORTRAIT_HEIGHT - actionsH * 2 - 64;
-      int singleY = PORTRAIT_HEIGHT - actionsH - 24;
+      const int buttonGap = 12;
+      const int bottomMargin = margin; // 24px
 
       // Compute what is drawn based on flags
       String firstAction = "";
@@ -700,24 +1020,30 @@ void loop() {
       bool didAction = false;
       auto inRect = [&](int rx, int ry, int rw, int rh) { return x >= rx && x <= rx + rw && y >= ry && y <= ry + rh; };
       if (firstAction.length() > 0 && secondAction.length() == 0) {
+        // Single button layout (full-width)
+        int singleY = PORTRAIT_HEIGHT - actionsH - bottomMargin;
         if (inRect(margin, singleY, contentWidth, actionsH)) {
-          // Press feedback: darker bar + working text, fast update
           drawActionBarPressed(margin, singleY, contentWidth, actionsH, firstAction.c_str());
           canvas.pushCanvas(0, 0, UPDATE_MODE_A2);
           if (firstAction == "Reserve") didAction = postReserve15();
           else if (firstAction == "Extend") didAction = postExtend();
           else if (firstAction == "End Early") didAction = postEndEarly();
         }
-      } else {
-        if (firstAction.length() > 0 && inRect(margin, actionsYTop, contentWidth, actionsH)) {
-          drawActionBarPressed(margin, actionsYTop, contentWidth, actionsH, firstAction.c_str());
+      } else if (firstAction.length() > 0 && secondAction.length() > 0) {
+        // Two buttons: side-by-side at bottom
+        int buttonY = PORTRAIT_HEIGHT - actionsH - bottomMargin;
+        int buttonWidth = (contentWidth - buttonGap) / 2;
+        if (inRect(margin, buttonY, buttonWidth, actionsH)) {
+          // First button (left)
+          drawActionBarPressed(margin, buttonY, buttonWidth, actionsH, firstAction.c_str());
           canvas.pushCanvas(0, 0, UPDATE_MODE_A2);
           if (firstAction == "Reserve") didAction = postReserve15();
           else if (firstAction == "Extend") didAction = postExtend();
           else if (firstAction == "End Early") didAction = postEndEarly();
         }
-        if (secondAction.length() > 0 && inRect(margin, actionsYTop + actionsH + 20, contentWidth, actionsH)) {
-          drawActionBarPressed(margin, actionsYTop + actionsH + 20, contentWidth, actionsH, secondAction.c_str());
+        if (inRect(margin + buttonWidth + buttonGap, buttonY, buttonWidth, actionsH)) {
+          // Second button (right)
+          drawActionBarPressed(margin + buttonWidth + buttonGap, buttonY, buttonWidth, actionsH, secondAction.c_str());
           canvas.pushCanvas(0, 0, UPDATE_MODE_A2);
           if (secondAction == "End Early") didAction = postEndEarly();
           else if (secondAction == "Extend") didAction = postExtend();
@@ -737,6 +1063,12 @@ void loop() {
         }
         // Short cooldown after action
         touchCooldownUntilMs = millis() + 1200;
+        
+        // If in temporary wake mode and user took an action, extend the wake time
+        if (inTemporaryWakeMode) {
+          temporaryWakeStartMs = millis(); // Reset timer
+          Serial.println("[loop] Action taken in temporary wake mode - extended 30s");
+        }
       }
     }
   }

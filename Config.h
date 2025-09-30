@@ -35,10 +35,10 @@
 
 // Optional TTF font paths on SD (root). If absent, built-in fonts are used
 #ifndef FONT_REGULAR_PATH
-#define FONT_REGULAR_PATH "/FreeSans.ttf"
+#define FONT_REGULAR_PATH "/Inter.ttf"
 #endif
 #ifndef FONT_BOLD_PATH
-#define FONT_BOLD_PATH "/FreeSansBold.ttf"
+#define FONT_BOLD_PATH "/InterBold.ttf"
 #endif
 
 // UI tunables
@@ -84,6 +84,20 @@
 // Debug logging: 0=minimal (errors only), 1=verbose (all operations)
 #ifndef DEBUG_LOGGING
 #define DEBUG_LOGGING 1
+#endif
+
+// Business hours (deep sleep outside these times to conserve battery)
+#ifndef ENABLE_BUSINESS_HOURS
+#define ENABLE_BUSINESS_HOURS 1  // 1=enable business hours sleep, 0=always active (24/7)
+#endif
+#ifndef BUSINESS_HOURS_START
+#define BUSINESS_HOURS_START 8  // 8 AM (24-hour format, 0-23)
+#endif
+#ifndef BUSINESS_HOURS_END
+#define BUSINESS_HOURS_END 19   // 7 PM (24-hour format, 0-23)
+#endif
+#ifndef DEEP_SLEEP_WEEKENDS
+#define DEEP_SLEEP_WEEKENDS 1   // 1=deep sleep Sat/Sun, 0=stay active on weekends
 #endif
 
 // Power optimization toggles

@@ -2,5 +2,9 @@
     "wifi_ssid": "YourWiFiSSID",
     "wifi_password": "YourWiFiPassword",
     "display_key": "yourdisplaykeyhere",
-    "refresh_seconds": 300
+    "refresh_seconds": 300,
+    "enable_business_hours": 1,
+    "business_hours_start": 8,
+    "business_hours_end": 19,
+    "deep_sleep_weekends": 1
   }
