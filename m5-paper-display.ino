@@ -804,7 +804,7 @@ void setup() {
           int bizEnd       = cfg["business_hours_end"] | BUSINESS_HOURS_END;
           int sleepWeekend = cfg["deep_sleep_weekends"] | (int)DEEP_SLEEP_WEEKENDS;
           displayKey = String(key);
-          roomName   = displayKey; // until API loads real name
+          roomName   = "Demo Room"; // until API loads real name
           // Override Wi-Fi creds used by connectWiFi
           wifiSsidStr = String(ssid);
           wifiPwStr   = String(pw);
