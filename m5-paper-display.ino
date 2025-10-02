@@ -52,6 +52,12 @@ static int tzOffsetMinutes = 0; // from API 'timezone' (hours) * 60
 static unsigned long lastSleepMs = 0;
 static unsigned long lastNtpSyncMs = 0; // Track when we last synced NTP
 static uint32_t consecutiveTimerWakeMisses = 0;
+
+// Error state tracking
+static bool hasCriticalError = false;
+static String errorMessage = "";
+static uint32_t consecutiveApiFails = 0;
+
 static uint32_t consecutiveExt0Bounces = 0;
 static unsigned long ext0CooldownUntilMs = 0;
 
@@ -94,6 +100,9 @@ static void updateVoltageString() {
 
 // Check if current time is within business hours (or temporary wake mode)
 static bool isWithinBusinessHours() {
+  // Critical errors disable business hours (no touch interaction)
+  if (hasCriticalError) return false;
+  
   // Temporary wake mode overrides business hours check
   if (inTemporaryWakeMode) return true;
   
@@ -553,8 +562,25 @@ void drawUI() {
   }
   canvas.drawString(nextMeetingTime.c_str(), margin, y);
 
+  // Error message area (replaces buttons if critical error)
+  if (hasCriticalError) {
+    int messageY = PORTRAIT_HEIGHT - 80;
+    canvas.setTextDatum(TC_DATUM);
+    if (hasTTFFonts) {
+      useTTF(FONT_REGULAR_PATH, 28);
+    } else {
+      canvas.setTextFont(1);
+      canvas.setTextSize(3);
+    }
+    canvas.setTextColor(12); // Darker for visibility
+    canvas.drawString("ERROR", PORTRAIT_WIDTH / 2, messageY);
+    messageY += 36;
+    canvas.setTextColor(TEXT_COLOR_SHADE);
+    canvas.drawString(errorMessage.c_str(), PORTRAIT_WIDTH / 2, messageY);
+  canvas.setTextDatum(TL_DATUM);
+  }
   // Actions area at bottom (only show buttons if within business hours - touch is active)
-  if (isWithinBusinessHours()) {
+  else if (isWithinBusinessHours()) {
   int actionsH = 108;
     int buttonGap = 12; // gap between two buttons
     int bottomMargin = margin; // match left/right margin (24px)
@@ -638,8 +664,17 @@ static bool connectWiFi() {
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiConnected) {
     LOG("[connectWiFi] SUCCESS in %lums, IP=%s\n", millis() - start, WiFi.localIP().toString().c_str());
+    // Success - reset consecutive fail counter if we had one
+    if (consecutiveApiFails > 0 && consecutiveApiFails < 3) {
+      consecutiveApiFails = 0;
+    }
   } else {
     Serial.printf("ERROR: Wi-Fi connect failed status=%d\n", (int)WiFi.status());
+    consecutiveApiFails++;
+    if (consecutiveApiFails >= 3) {
+      hasCriticalError = true;
+      errorMessage = "Wi-Fi connection failed. Check credentials.";
+    }
     return false;
   }
   // Only sync NTP if we haven't synced yet, or it's been more than 24 hours
@@ -682,11 +717,16 @@ static bool fetchSchedule() {
   int actionParam = g_action;
   g_action = 0;
   updateVoltageString();
-  String url = String(SCHEDULE_API_BASE) + "/eink/" + displayKey + "?action=" + String(actionParam) + "&voltage=" + voltstr;
+  String url = String(SCHEDULE_API_BASE) + "/eink/" + displayKey + "?action=" + String(actionParam) + "&voltage=" + voltstr + "&model=m3paper";
   LOG("[fetchSchedule] URL: %s\n", url.c_str());
   if (!http.begin(client, url)) {
     Serial.println("ERROR: fetchSchedule: http.begin() failed");
     disconnectWiFi();
+    consecutiveApiFails++;
+    if (consecutiveApiFails >= 3) {
+      hasCriticalError = true;
+      errorMessage = "Network error. Check Wi-Fi configuration.";
+    }
     return false;
   }
   LOG("[fetchSchedule] Sending GET request...\n");
@@ -697,6 +737,11 @@ static bool fetchSchedule() {
     Serial.printf("ERROR: fetchSchedule: HTTP GET failed code=%d (%s)\n", code, http.errorToString(code).c_str());
     http.end();
     disconnectWiFi();
+    consecutiveApiFails++;
+    if (consecutiveApiFails >= 3) {
+      hasCriticalError = true;
+      errorMessage = "API error. Please contact support.";
+    }
     return false;
   }
 
@@ -710,6 +755,9 @@ static bool fetchSchedule() {
     return false;
   }
   LOG("[fetchSchedule] JSON parsed successfully\n");
+  
+  // Success - reset error counters
+  consecutiveApiFails = 0;
 
   // Map fields per Meeting Room 365 e-ink API
   roomName            = doc["name"].as<String>();
@@ -787,14 +835,19 @@ void setup() {
   canvas.setTextDatum(TL_DATUM);
 
   // Load config.json from SD if present
+  Serial.println("[setup] Attempting to load config.json from SD...");
   if (SD.begin()) {
+    Serial.println("[setup] SD card initialized");
     if (SD.exists(SD_CONFIG_PATH)) {
+      Serial.printf("[setup] Found config file: %s\n", SD_CONFIG_PATH);
       File f = SD.open(SD_CONFIG_PATH, FILE_READ);
       if (f) {
+        Serial.printf("[setup] Opened config file, size: %d bytes\n", f.size());
         DynamicJsonDocument cfg(2048);
         DeserializationError e = deserializeJson(cfg, f);
         f.close();
         if (!e) {
+          Serial.println("[setup] JSON parsed successfully");
           const char* ssid = cfg["wifi_ssid"] | WIFI_SSID;
           const char* pw   = cfg["wifi_password"] | WIFI_PW;
           const char* key  = cfg["display_key"] | ROOM_ID;
@@ -803,11 +856,25 @@ void setup() {
           int bizStart     = cfg["business_hours_start"] | BUSINESS_HOURS_START;
           int bizEnd       = cfg["business_hours_end"] | BUSINESS_HOURS_END;
           int sleepWeekend = cfg["deep_sleep_weekends"] | (int)DEEP_SLEEP_WEEKENDS;
+          
+          Serial.printf("[setup] Raw key from JSON: '%s'\n", key);
+          Serial.printf("[setup] cfg.containsKey(\"display_key\"): %d\n", cfg.containsKey("display_key"));
+          
           displayKey = String(key);
           roomName   = "Demo Room"; // until API loads real name
           // Override Wi-Fi creds used by connectWiFi
           wifiSsidStr = String(ssid);
           wifiPwStr   = String(pw);
+          
+          Serial.printf("[setup] Final displayKey: '%s'\n", displayKey.c_str());
+          
+          // Check for demo/placeholder display keys (but allow any actual configured value)
+          // Only flag obviously invalid/placeholder values
+          if (displayKey == "" || displayKey == "your_display_key_here") {
+            hasCriticalError = true;
+            errorMessage = "Configure display_key in config.json";
+            Serial.printf("ERROR: Invalid display key detected: '%s'\n", displayKey.c_str());
+          }
           // Update refresh interval
           refreshIntervalSeconds = (uint32_t)refresh;
           // Update business hours
@@ -861,14 +928,23 @@ void setup() {
     LOG("No logo.png or logo.jpg found on SD\n");
   }
 
+  // Check for critically low battery (below 3.0V = ~5%)
+  updateVoltageString();
+  uint32_t mv = M5.getBatteryVoltage();
+  if (mv > 100 && mv < 3000) { // sanity check: not 0, but dangerously low
+    hasCriticalError = true;
+    errorMessage = "Low battery. Please charge device.";
+    Serial.printf("ERROR: Critically low battery: %dmV\n", mv);
+  }
+
   // Default placeholders when offline
   currentMeetingTitle = "Daily Standup";
   currentMeetingTime  = "10:00 - 10:30";
   nextMeetingTitle    = "Design Sync";
   nextMeetingTime     = "10:45 - 11:30";
 
-  // Try fetch schedule
-  if (!fetchSchedule()) {
+  // Try fetch schedule (skip if already in critical error state)
+  if (!hasCriticalError && !fetchSchedule()) {
     LOG("Initial fetchSchedule failed; using placeholders\n");
   }
 
@@ -876,8 +952,8 @@ void setup() {
 
   // Push to display using a high-quality grayscale mode
   canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-  // Allow time to read serial logs before sleep
-  delay(2000);
+  // Allow time for e-ink refresh to complete (GC16 mode takes longer)
+  delay(4000);
 
   // Switch to light sleep with TP INT wake to allow touch any time
   #if EPD_POWER_OFF_IN_SLEEP
@@ -929,7 +1005,7 @@ void loop() {
     }
     drawUI(); // Will show buttons because inTemporaryWakeMode = true
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-    delay(2500); // Allow e-ink refresh to complete
+    delay(4000); // Allow e-ink refresh to complete (GC16 mode takes longer)
     Serial.println("[loop] Temporary wake mode active - touch enabled for 30s");
     // Fall through to normal touch handling loop below
   }
@@ -950,7 +1026,7 @@ void loop() {
     LOG("[loop] Pushing canvas to display...\n");
     canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
     LOG("[loop] Canvas pushed, waiting for e-ink refresh to complete...\n");
-    delay(2500); // Allow e-ink display time to complete physical refresh
+    delay(4000); // Allow e-ink display time to complete physical refresh (GC16 mode takes longer)
     LOG("[loop] Re-arming sleep after timer wake\n");
     rearmAndSleep();
     return;
@@ -1055,6 +1131,8 @@ void loop() {
         canvas.fillCanvas(0);
         drawUI();
         canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+        // Allow e-ink refresh to complete before waiting for finger release
+        delay(4000);
         // Wait for finger release to avoid triggering new action on updated UI
         unsigned long startWait = millis();
         while (!M5.TP.isFingerUp() && millis() - startWait < 1500) {
