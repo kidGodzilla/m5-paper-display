@@ -67,6 +67,15 @@ static int businessHoursStart = BUSINESS_HOURS_START;
 static int businessHoursEnd = BUSINESS_HOURS_END;
 static bool deepSleepWeekends = DEEP_SLEEP_WEEKENDS;
 
+// Interactive features configuration
+static bool enableInstantReserve = ENABLE_INSTANT_RESERVE;
+static bool enableExtendMeeting = ENABLE_EXTEND_MEETING;
+static bool enableEndEarly = ENABLE_END_EARLY;
+static uint32_t batterySaverSleepSeconds = BATTERY_SAVER_SLEEP_SECONDS;
+
+// Battery saver mode: auto-enabled when all interactive features disabled
+static bool enableBatterySaver = false; // computed at runtime
+
 // Temporary wake mode (button press during deep sleep)
 static bool inTemporaryWakeMode = false;
 static unsigned long temporaryWakeStartMs = 0;
@@ -102,6 +111,9 @@ static void updateVoltageString() {
 static bool isWithinBusinessHours() {
   // Critical errors disable business hours (no touch interaction)
   if (hasCriticalError) return false;
+  
+  // Battery saver mode disables touch entirely (no buttons shown, always deep sleep)
+  if (enableBatterySaver) return false;
   
   // Temporary wake mode overrides business hours check
   if (inTemporaryWakeMode) return true;
@@ -236,6 +248,83 @@ static void logWakeCause() {
 }
 
 static void rearmAndSleep() {
+  // Battery saver mode: deep sleep always (no touch interaction)
+  if (enableBatterySaver && !inTemporaryWakeMode) {
+    uint32_t sleepSeconds = batterySaverSleepSeconds;
+    
+    // Align wake time to 5-minute intervals to match typical meeting booking times
+    if (timeSynced) {
+      time_t nowSecs = time(nullptr);
+      time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+      struct tm localInfo;
+      gmtime_r(&localSecs, &localInfo);
+      
+      int currentMin = localInfo.tm_min;
+      int currentSec = localInfo.tm_sec;
+      
+      // Find next 5-minute interval (0, 5, 10, 15, ..., 55)
+      int nextIntervalMin = ((currentMin / 5) + 1) * 5;
+      if (nextIntervalMin >= 60) {
+        nextIntervalMin = 0; // wrap to next hour
+      }
+      
+      // Calculate seconds until next 5-minute boundary
+      int minutesUntil = (nextIntervalMin - currentMin);
+      if (minutesUntil <= 0) {
+        minutesUntil += 60; // wrapped to next hour
+      }
+      uint32_t secondsToInterval = (minutesUntil * 60) - currentSec;
+      
+      // Use the time to next interval, but ensure it's reasonable (at least 30s, max configured value)
+      if (secondsToInterval < 30) {
+        secondsToInterval += 300; // Add 5 minutes if we're too close
+      }
+      if (secondsToInterval > batterySaverSleepSeconds) {
+        secondsToInterval = batterySaverSleepSeconds; // Cap at configured max
+      }
+      
+      sleepSeconds = secondsToInterval;
+      Serial.printf("Battery saver: aligning to 5-min interval (current: %02d:%02d, next interval: :%02d, sleep: %lus)\n",
+                    currentMin, currentSec, nextIntervalMin, (unsigned long)sleepSeconds);
+    } else {
+      Serial.printf("Battery saver: time not synced, using configured interval: %lus\n", (unsigned long)sleepSeconds);
+    }
+    
+    uint64_t deepSleepUs = (uint64_t)sleepSeconds * 1000000ULL;
+    
+    Serial.printf("Battery saver: deep sleeping for %lu seconds\n", (unsigned long)sleepSeconds);
+    
+    // Show what time we expect to wake up
+    if (timeSynced) {
+      time_t wakeTime = time(nullptr) + sleepSeconds;
+      time_t localWake = wakeTime + (tzOffsetMinutes * 60);
+      struct tm wakeInfo;
+      gmtime_r(&localWake, &wakeInfo);
+      Serial.printf("Expected wake time: %02d:%02d:%02d\n", wakeInfo.tm_hour, wakeInfo.tm_min, wakeInfo.tm_sec);
+    }
+    
+    Serial.println("Disabling power rails...");
+    M5.disableEPDPower();
+    // Keep EXTPower enabled so buttons can wake the device
+    // M5.disableEXTPower(); // Commented out - buttons need power
+    WiFi.mode(WIFI_OFF);
+    
+    // Arm timer wake
+    esp_sleep_enable_timer_wakeup(deepSleepUs);
+    Serial.printf("Timer wake armed for %lu seconds\n", (unsigned long)sleepSeconds);
+    
+    // Arm physical button wake (G37, G38, G39) so user can check schedule
+    uint64_t buttonMask = (1ULL << GPIO_NUM_37) | (1ULL << GPIO_NUM_38) | (1ULL << GPIO_NUM_39);
+    esp_err_t err = esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
+    Serial.println("Entering deep sleep NOW (battery saver)");
+    Serial.flush();
+    
+    delay(200);
+    esp_deep_sleep_start();
+    // Device will reboot on wake
+  }
+  
   // Check if we're outside business hours - if so, deep sleep until next business day
   if (!isWithinBusinessHours()) {
     uint64_t deepSleepSeconds = secondsUntilBusinessHours();
@@ -585,16 +674,16 @@ void drawUI() {
     int buttonGap = 12; // gap between two buttons
     int bottomMargin = margin; // match left/right margin (24px)
 
-  // Decide actions based on flags
+  // Decide actions based on flags AND config settings
   String firstAction = "";
   String secondAction = "";
   if (occupied) {
-    if (canExtend) firstAction = "Extend";
-    if (canEndMeeting) {
+    if (canExtend && enableExtendMeeting) firstAction = "Extend";
+    if (canEndMeeting && enableEndEarly) {
       if (firstAction.length() == 0) firstAction = "End Early"; else secondAction = "End Early";
     }
   } else {
-      if (canInstantReserve) firstAction = "Reserve";
+      if (canInstantReserve && enableInstantReserve) firstAction = "Reserve";
   }
 
   if (firstAction.length() > 0 && secondAction.length() == 0) {
@@ -609,7 +698,7 @@ void drawUI() {
       drawActionBar(margin + buttonWidth + buttonGap, buttonY, buttonWidth, actionsH, secondAction.c_str());
     }
   } else {
-    // Outside business hours: show sleep message instead of buttons
+    // Outside business hours OR battery saver mode when vacant: show sleep message
     int messageY = PORTRAIT_HEIGHT - 100; // Position in button area
     canvas.setTextDatum(TC_DATUM); // Top-Center alignment
     if (hasTTFFonts) {
@@ -618,31 +707,79 @@ void drawUI() {
       canvas.setTextFont(1);
       canvas.setTextSize(3);
     }
-    canvas.drawString("Device is sleeping.", PORTRAIT_WIDTH / 2, messageY);
-    messageY += 36;
     
-    // Calculate and show next wake time
-    time_t nowSecs = time(nullptr);
-    time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
-    struct tm localInfo;
-    gmtime_r(&localSecs, &localInfo);
-    
-    String nextUpdate = "Next update: ";
-    if (deepSleepWeekends && (localInfo.tm_wday == 0 || localInfo.tm_wday == 6)) {
-      nextUpdate += "Monday " + String(businessHoursStart) + ":00";
-    } else if (localInfo.tm_hour >= businessHoursEnd) {
-      // After hours - wake tomorrow
-      if (deepSleepWeekends && ((localInfo.tm_wday + 1) % 7 == 0 || (localInfo.tm_wday + 1) % 7 == 6)) {
-        nextUpdate += "Monday " + String(businessHoursStart) + ":00";
-      } else {
-        nextUpdate += "Tomorrow " + String(businessHoursStart) + ":00";
+    // Different message for battery saver vs business hours
+    if (enableBatterySaver) {
+      String msg = occupied ? "Battery saver mode enabled." : "Saving battery while vacant.";
+      canvas.drawString(msg.c_str(), PORTRAIT_WIDTH / 2, messageY);
+      messageY += 36;
+      
+      // Calculate next wake time aligned to 5-minute interval
+      time_t nowSecs = time(nullptr);
+      time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+      struct tm localInfo;
+      gmtime_r(&localSecs, &localInfo);
+      
+      // Calculate next 5-minute interval
+      int currentMin = localInfo.tm_min;
+      int currentSec = localInfo.tm_sec;
+      int nextIntervalMin = ((currentMin / 5) + 1) * 5;
+      if (nextIntervalMin >= 60) {
+        nextIntervalMin = 0;
       }
+      int minutesUntil = (nextIntervalMin - currentMin);
+      if (minutesUntil <= 0) {
+        minutesUntil += 60;
+      }
+      uint32_t secondsToInterval = (minutesUntil * 60) - currentSec;
+      if (secondsToInterval < 30) {
+        secondsToInterval += 300; // Add 5 minutes if too close
+      }
+      if (secondsToInterval > batterySaverSleepSeconds) {
+        secondsToInterval = batterySaverSleepSeconds;
+      }
+      
+      // Calculate next wake time
+      time_t nextWakeSecs = localSecs + secondsToInterval;
+      struct tm nextWake;
+      gmtime_r(&nextWakeSecs, &nextWake);
+      
+      char buf[32];
+      if (TWENTYFOUR_HOUR) {
+        snprintf(buf, sizeof(buf), "Next check: %02d:%02d", nextWake.tm_hour, nextWake.tm_min);
+      } else {
+        int hour12 = nextWake.tm_hour % 12; if (hour12 == 0) hour12 = 12;
+        const char* ampm = (nextWake.tm_hour < 12) ? "AM" : "PM";
+        snprintf(buf, sizeof(buf), "Next check: %d:%02d %s", hour12, nextWake.tm_min, ampm);
+      }
+      canvas.drawString(buf, PORTRAIT_WIDTH / 2, messageY);
     } else {
-      // Before hours - wake today
-      nextUpdate += "Today " + String(businessHoursStart) + ":00";
+      canvas.drawString("Device is sleeping.", PORTRAIT_WIDTH / 2, messageY);
+      messageY += 36;
+      
+      // Calculate and show next wake time
+      time_t nowSecs = time(nullptr);
+      time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+      struct tm localInfo;
+      gmtime_r(&localSecs, &localInfo);
+      
+      String nextUpdate = "Next update: ";
+      if (deepSleepWeekends && (localInfo.tm_wday == 0 || localInfo.tm_wday == 6)) {
+        nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+      } else if (localInfo.tm_hour >= businessHoursEnd) {
+        // After hours - wake tomorrow
+        if (deepSleepWeekends && ((localInfo.tm_wday + 1) % 7 == 0 || (localInfo.tm_wday + 1) % 7 == 6)) {
+          nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+        } else {
+          nextUpdate += "Tomorrow " + String(businessHoursStart) + ":00";
+        }
+      } else {
+        // Before hours - wake today
+        nextUpdate += "Today " + String(businessHoursStart) + ":00";
+      }
+      
+      canvas.drawString(nextUpdate.c_str(), PORTRAIT_WIDTH / 2, messageY);
     }
-    
-    canvas.drawString(nextUpdate.c_str(), PORTRAIT_WIDTH / 2, messageY);
     canvas.setTextDatum(TL_DATUM);
   }
 }
@@ -834,6 +971,9 @@ void setup() {
   canvas.setTextSize(3);
   canvas.setTextDatum(TL_DATUM);
 
+  // Initialize battery saver from default config values
+  enableBatterySaver = (!enableInstantReserve && !enableExtendMeeting && !enableEndEarly);
+
   // Load config.json from SD if present
   Serial.println("[setup] Attempting to load config.json from SD...");
   if (SD.begin()) {
@@ -856,6 +996,10 @@ void setup() {
           int bizStart     = cfg["business_hours_start"] | BUSINESS_HOURS_START;
           int bizEnd       = cfg["business_hours_end"] | BUSINESS_HOURS_END;
           int sleepWeekend = cfg["deep_sleep_weekends"] | (int)DEEP_SLEEP_WEEKENDS;
+          int instantReserve = cfg["enable_instant_reserve"] | (int)ENABLE_INSTANT_RESERVE;
+          int extendMeeting = cfg["enable_extend_meeting"] | (int)ENABLE_EXTEND_MEETING;
+          int endEarly = cfg["enable_end_early"] | (int)ENABLE_END_EARLY;
+          int batterySaverSleep = cfg["battery_saver_sleep_seconds"] | (int)BATTERY_SAVER_SLEEP_SECONDS;
           
           Serial.printf("[setup] Raw key from JSON: '%s'\n", key);
           Serial.printf("[setup] cfg.containsKey(\"display_key\"): %d\n", cfg.containsKey("display_key"));
@@ -882,8 +1026,17 @@ void setup() {
           businessHoursStart = bizStart;
           businessHoursEnd = bizEnd;
           deepSleepWeekends = (sleepWeekend != 0);
+          // Update interactive features
+          enableInstantReserve = (instantReserve != 0);
+          enableExtendMeeting = (extendMeeting != 0);
+          enableEndEarly = (endEarly != 0);
+          batterySaverSleepSeconds = (uint32_t)batterySaverSleep;
+          // Battery saver auto-enabled if all interactive features are disabled
+          enableBatterySaver = (!enableInstantReserve && !enableExtendMeeting && !enableEndEarly);
           Serial.println("Loaded SD config.json");
           LOG("Business hours: %s, %d:00 - %d:00, weekends=%s\n", enableBusinessHours ? "enabled" : "disabled", businessHoursStart, businessHoursEnd, deepSleepWeekends ? "sleep" : "active");
+          LOG("Interactive features: reserve=%s extend=%s endEarly=%s\n", enableInstantReserve ? "yes" : "no", enableExtendMeeting ? "yes" : "no", enableEndEarly ? "yes" : "no");
+          LOG("Battery saver: %s (auto), sleep=%lus\n", enableBatterySaver ? "enabled" : "disabled", (unsigned long)batterySaverSleepSeconds);
         } else {
           Serial.println("ERROR: Failed to parse config.json");
         }
@@ -955,25 +1108,12 @@ void setup() {
   // Allow time for e-ink refresh to complete (GC16 mode takes longer)
   delay(4000);
 
-  // Switch to light sleep with TP INT wake to allow touch any time
-  #if EPD_POWER_OFF_IN_SLEEP
-  M5.disableEPDPower();
-  #endif
-  #if EXTPWR_OFF_IN_SLEEP
-  M5.disableEXTPower();
-  #endif
-  clampAndLogRefresh();
-  uint64_t armUs = (uint64_t)refreshIntervalSeconds * 1000000ULL;
-  LOG("Arming timer wake in %lus (%llu us)\n", (unsigned long)refreshIntervalSeconds, (unsigned long long)armUs);
-  esp_sleep_enable_timer_wakeup(armUs);
-  bool extArmed = armExt0IfIdle();
-  LOG("EXT0 armed=%s\n", extArmed ? "yes" : "no");
   // Touch is initialized by M5.begin when touch is enabled; just set rotation
   M5.TP.SetRotation(SCREEN_ROTATION);
-  WiFi.mode(WIFI_OFF);
-  lastSleepMs = millis();
-  LOG("Entering light sleep\n");
-  esp_light_sleep_start();
+  
+  // Enter appropriate sleep mode (deep sleep for battery saver, light sleep otherwise)
+  LOG("Setup complete, entering sleep mode\n");
+  rearmAndSleep();
 }
 
 void loop() {
@@ -989,9 +1129,9 @@ void loop() {
   #endif
   delay(10); // allow rails to stabilize
   
-  // If button wake during deep sleep (outside business hours), enter temporary wake mode
+  // If button wake during deep sleep (battery saver or outside business hours), enter temporary wake mode
   if (wakeupCause == ESP_SLEEP_WAKEUP_EXT1) {
-    Serial.println("[loop] BUTTON wake during deep sleep: entering temporary wake mode (30s)");
+    Serial.println("[loop] BUTTON wake (EXT1) during deep sleep: entering temporary wake mode (30s)");
     inTemporaryWakeMode = true;
     temporaryWakeStartMs = millis();
     
@@ -1008,6 +1148,9 @@ void loop() {
     delay(4000); // Allow e-ink refresh to complete (GC16 mode takes longer)
     Serial.println("[loop] Temporary wake mode active - touch enabled for 30s");
     // Fall through to normal touch handling loop below
+  } else if (wakeupCause != ESP_SLEEP_WAKEUP_TIMER) {
+    // Unexpected wake cause in battery saver mode - log and continue to timer refresh
+    Serial.printf("[loop] WARNING: Unexpected wake cause during battery saver: %d\n", (int)wakeupCause);
   }
   
   // If this was a timer wake, refresh data and UI immediately
@@ -1081,16 +1224,16 @@ void loop() {
       const int buttonGap = 12;
       const int bottomMargin = margin; // 24px
 
-      // Compute what is drawn based on flags
+      // Compute what is drawn based on flags AND config settings
       String firstAction = "";
       String secondAction = "";
       if (occupied) {
-        if (canExtend) firstAction = "Extend";
-        if (canEndMeeting) {
+        if (canExtend && enableExtendMeeting) firstAction = "Extend";
+        if (canEndMeeting && enableEndEarly) {
           if (firstAction.length() == 0) firstAction = "End Early"; else secondAction = "End Early";
         }
       } else {
-        if (canInstantReserve) firstAction = "Reserve";
+        if (canInstantReserve && enableInstantReserve) firstAction = "Reserve";
       }
 
       bool didAction = false;

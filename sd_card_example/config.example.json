@@ -6,5 +6,9 @@
     "enable_business_hours": 1,
     "business_hours_start": 8,
     "business_hours_end": 19,
-    "deep_sleep_weekends": 1
+    "deep_sleep_weekends": 1,
+    "battery_saver_sleep_seconds": 300,    
+    "enable_instant_reserve": 1,
+    "enable_extend_meeting": 1,
+    "enable_end_early": 1
   }

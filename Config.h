@@ -100,6 +100,22 @@
 #define DEEP_SLEEP_WEEKENDS 1   // 1=deep sleep Sat/Sun, 0=stay active on weekends
 #endif
 
+// Interactive features (buttons on display)
+#ifndef ENABLE_INSTANT_RESERVE
+#define ENABLE_INSTANT_RESERVE 1  // 1=show Reserve button when available, 0=disabled
+#endif
+#ifndef ENABLE_EXTEND_MEETING
+#define ENABLE_EXTEND_MEETING 1   // 1=show Extend button when possible, 0=disabled
+#endif
+#ifndef ENABLE_END_EARLY
+#define ENABLE_END_EARLY 1        // 1=show End Early button when in meeting, 0=disabled
+#endif
+
+// Battery saver: automatically enabled when all interactive features are disabled
+#ifndef BATTERY_SAVER_SLEEP_SECONDS
+#define BATTERY_SAVER_SLEEP_SECONDS 300  // Deep sleep duration when in battery saver mode (5 minutes default)
+#endif
+
 // Power optimization toggles
 #ifndef EPD_POWER_OFF_IN_SLEEP
 #define EPD_POWER_OFF_IN_SLEEP 1 // disable EPD power during light sleep, re-enable on wake

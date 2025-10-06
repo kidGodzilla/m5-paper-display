@@ -53,12 +53,20 @@ This is also available in the US through Mouser.
   - **Timer**: Periodic refresh (default: 300 seconds / 5 minutes)
 - Action buttons (Reserve, Extend, End Early) provide immediate visual feedback and update the schedule
 
-### Power Management (Outside Business Hours)
+### Power Management
+
+**Business Hours Mode:**
 - **Deep Sleep**: Automatically engages outside configured business hours
 - **Default Schedule**: Active 8 AM - 7 PM weekdays, deep sleep nights and weekends
 - **Wake Time**: Automatically calculates and wakes at the start of next business day
-- **Battery Savings**: Deep sleep reduces power consumption from ~3-32mA to ~1-10mA
 - **Customizable**: Set your own business hours or disable entirely for 24/7 operation
+
+**Battery Saver Mode (Display-Only):**
+- **Auto-Enabled**: When all interactive features (Reserve, Extend, End Early) are disabled
+- **Deep Sleep**: Wakes at 5-minute intervals (e.g., :00, :05, :10, :15...) to refresh schedule
+- **Smart Alignment**: Automatically adjusts sleep duration to wake at round times when meetings typically start
+- **Maximum Battery Life**: Deep sleep reduces power consumption from ~3-32mA to ~1-10mA
+- **Display-Only**: No touch buttons shown, pure schedule display
 
 ## Configuration
 
@@ -77,6 +85,12 @@ Project-level config lives in `Config.h`:
 - `BUSINESS_HOURS_START`: Hour when display becomes active, 0-23 (default: 8 = 8 AM)
 - `BUSINESS_HOURS_END`: Hour when display sleeps, 0-23 (default: 19 = 7 PM)
 - `DEEP_SLEEP_WEEKENDS`: `1` to sleep Sat/Sun, `0` to stay active (default: 1)
+
+**Interactive Features (Button Controls):**
+- `ENABLE_INSTANT_RESERVE`: `1` to show Reserve button, `0` to disable (default: 1)
+- `ENABLE_EXTEND_MEETING`: `1` to show Extend button, `0` to disable (default: 1)
+- `ENABLE_END_EARLY`: `1` to show End Early button, `0` to disable (default: 1)
+- `BATTERY_SAVER_SLEEP_SECONDS`: Sleep interval when all features disabled (default: 300 = 5 min)
 
 **Fonts & Logo:**
 - `FONT_REGULAR_PATH`: Path to TTF regular font on SD (default: `/FreeSans.ttf`)
@@ -108,9 +122,30 @@ Optional SD overrides via `/config.json` on the microSD card (see `sd_card_examp
   "enable_business_hours": 1,
   "business_hours_start": 8,
   "business_hours_end": 19,
-  "deep_sleep_weekends": 1
+  "deep_sleep_weekends": 1,
+  "battery_saver_sleep_seconds": 300,
+  "enable_instant_reserve": 1,
+  "enable_extend_meeting": 1,
+  "enable_end_early": 1
 }
 ```
+
+**Configuration Fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `wifi_ssid` | string | - | Wi-Fi network name |
+| `wifi_password` | string | - | Wi-Fi password |
+| `display_key` | string | - | Meeting Room 365 display key |
+| `refresh_seconds` | int | 300 | Refresh interval in normal mode (seconds) |
+| `enable_business_hours` | 0/1 | 1 | Enable business hours power management |
+| `business_hours_start` | 0-23 | 8 | Start hour (24-hour format) |
+| `business_hours_end` | 0-23 | 19 | End hour (24-hour format) |
+| `deep_sleep_weekends` | 0/1 | 1 | Deep sleep on Sat/Sun |
+| `enable_instant_reserve` | 0/1 | 1 | Show Reserve button when available |
+| `enable_extend_meeting` | 0/1 | 1 | Show Extend button during meetings |
+| `enable_end_early` | 0/1 | 1 | Show End Early button during meetings |
+| `battery_saver_sleep_seconds` | int | 300 | Sleep interval in battery saver mode |
 
 **Why use config.json?**
 - Change settings without recompiling/reflashing
@@ -169,18 +204,35 @@ convert your-logo.png -colorspace Gray -quality 90 -resize 400x60 logo.jpg
 
 Copy `sd_card_example/config.example.json` to your SD card as `/config.json` and edit with your settings.
 
-**Example for 24/7 operation:**
+**Example: Display-Only Mode (Maximum Battery Life)**
+```json
+{
+  "wifi_ssid": "OfficeWiFi",
+  "wifi_password": "YourPassword",
+  "display_key": "boardroom1",
+  "enable_instant_reserve": 0,
+  "enable_extend_meeting": 0,
+  "enable_end_early": 0,
+  "battery_saver_sleep_seconds": 300
+}
+```
+*Note: Battery saver mode auto-enables when all three interactive features are disabled. Device will wake at 5-minute intervals (:00, :05, :10, etc.) to refresh schedule.*
+
+**Example: 24/7 Interactive Operation**
 ```json
 {
   "wifi_ssid": "OfficeWiFi",
   "wifi_password": "YourPassword",
   "display_key": "boardroom1",
   "refresh_seconds": 300,
-  "enable_business_hours": 0
+  "enable_business_hours": 0,
+  "enable_instant_reserve": 1,
+  "enable_extend_meeting": 1,
+  "enable_end_early": 1
 }
 ```
 
-**Example for custom business hours (7 AM - 8 PM, including weekends):**
+**Example: Custom Business Hours (7 AM - 8 PM, Including Weekends)**
 ```json
 {
   "wifi_ssid": "OfficeWiFi",
@@ -193,4 +245,17 @@ Copy `sd_card_example/config.example.json` to your SD card as `/config.json` and
   "deep_sleep_weekends": 0
 }
 ```
+
+**Example: Reserve-Only Mode (No Meeting Controls)**
+```json
+{
+  "wifi_ssid": "OfficeWiFi",
+  "wifi_password": "YourPassword",
+  "display_key": "boardroom1",
+  "enable_instant_reserve": 1,
+  "enable_extend_meeting": 0,
+  "enable_end_early": 0
+}
+```
+*Note: With only Reserve enabled, users can book the room but cannot modify existing meetings.*
 
