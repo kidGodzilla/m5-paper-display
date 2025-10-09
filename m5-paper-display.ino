@@ -250,7 +250,48 @@ static void logWakeCause() {
   }
 }
 
+// Fast business-hours check that does not depend on UI state
+static bool isCurrentlyOutsideBusinessHours() {
+  if (!enableBusinessHours) return false; // feature disabled → always active
+  if (!timeSynced) {
+    // If time isn't synced, prefer conserving battery overnight
+    // Treat as outside hours so we don't refresh every few minutes at night
+    return true;
+  }
+  time_t nowSecs = time(nullptr);
+  time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+  struct tm tinfo;
+  gmtime_r(&localSecs, &tinfo);
+  int hour = tinfo.tm_hour;
+  int wday = tinfo.tm_wday; // 0=Sunday, 6=Saturday
+  if (deepSleepWeekends && (wday == 0 || wday == 6)) return true;
+  if (hour < businessHoursStart || hour >= businessHoursEnd) return true;
+  return false;
+}
+
 static void rearmAndSleep() {
+  // Outside business hours: deep sleep until next window (highest priority)
+  if (isCurrentlyOutsideBusinessHours()) {
+    uint64_t deepSleepSeconds = secondsUntilBusinessHours();
+    uint64_t deepSleepUs = deepSleepSeconds * 1000000ULL;
+    if (deepSleepUs > 0xFFFFFFFFFFFFULL) {
+      deepSleepUs = 86400ULL * 1000000ULL; // fallback: 1 day
+    }
+    Serial.printf("Deep sleeping outside business hours for %llu seconds\n", deepSleepSeconds);
+    Serial.println("Disabling power rails...");
+    M5.disableEPDPower();
+    WiFi.mode(WIFI_OFF);
+    esp_sleep_enable_timer_wakeup(deepSleepUs);
+    Serial.printf("Timer wake armed for %llu seconds\n", deepSleepSeconds);
+    uint64_t buttonMask = (1ULL << GPIO_NUM_37) | (1ULL << GPIO_NUM_38) | (1ULL << GPIO_NUM_39);
+    esp_err_t err = esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ALL_LOW);
+    Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
+    Serial.println("Entering deep sleep NOW");
+    Serial.flush();
+    lastSleepMs = millis();
+    delay(200);
+    esp_deep_sleep_start();
+  }
   // Battery saver mode: deep sleep always (no touch interaction)
   if (enableBatterySaver && !inTemporaryWakeMode) {
     uint32_t sleepSeconds = batterySaverSleepSeconds;
@@ -330,40 +371,7 @@ static void rearmAndSleep() {
     // Device will reboot on wake
   }
   
-  // Check if we're outside business hours - if so, deep sleep until next business day
-  if (!isWithinBusinessHours()) {
-    uint64_t deepSleepSeconds = secondsUntilBusinessHours();
-    uint64_t deepSleepUs = deepSleepSeconds * 1000000ULL;
-    
-    // Cap deep sleep to prevent overflow (max ~48 days)
-    if (deepSleepUs > 0xFFFFFFFFFFFFULL) {
-      deepSleepUs = 86400ULL * 1000000ULL; // fallback: 1 day
-    }
-    
-    Serial.printf("Deep sleeping outside business hours for %llu seconds\n", deepSleepSeconds);
-    Serial.println("Disabling power rails...");
-    M5.disableEPDPower();
-    // Keep EXTPower enabled so buttons can wake the device
-    // M5.disableEXTPower(); // Commented out - buttons need power
-    WiFi.mode(WIFI_OFF);
-    
-    // Arm timer wake for next business hours
-    esp_sleep_enable_timer_wakeup(deepSleepUs);
-    Serial.printf("Timer wake armed for %llu seconds\n", deepSleepSeconds);
-    
-    // Arm physical button wake (G37, G38, G39) so user can check schedule
-    uint64_t buttonMask = (1ULL << GPIO_NUM_37) | (1ULL << GPIO_NUM_38) | (1ULL << GPIO_NUM_39);
-    esp_err_t err = esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ALL_LOW);
-    Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
-    Serial.println("Entering deep sleep NOW");
-    Serial.flush();
-    // Track sleep start time for diagnostics
-    lastSleepMs = millis();
-    
-    delay(200);
-    esp_deep_sleep_start();
-    // Device will reboot on wake
-  }
+  // (Outside-business-hours already handled above)
   
   // Normal light sleep during business hours
   #if EPD_POWER_OFF_IN_SLEEP
@@ -705,7 +713,7 @@ void drawUI() {
       drawActionBar(margin + buttonWidth + buttonGap, buttonY, buttonWidth, actionsH, secondAction.c_str());
     }
   } else {
-    // Outside business hours OR battery saver mode when vacant: show sleep message
+    // Outside business hours OR battery saver mode: show sleep message
     int messageY = PORTRAIT_HEIGHT - 100; // Position in button area
     canvas.setTextDatum(TC_DATUM); // Top-Center alignment
     if (hasTTFFonts) {
@@ -715,8 +723,34 @@ void drawUI() {
       canvas.setTextSize(3);
     }
     
-    // Different message for battery saver vs business hours
-    if (enableBatterySaver) {
+    // Check business hours first (higher priority than battery saver)
+    if (isCurrentlyOutsideBusinessHours()) {
+      canvas.drawString("Device is sleeping.", PORTRAIT_WIDTH / 2, messageY);
+      messageY += 36;
+      
+      // Calculate and show next wake time
+      time_t nowSecs = time(nullptr);
+      time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
+      struct tm localInfo;
+      gmtime_r(&localSecs, &localInfo);
+      
+      String nextUpdate = "Next update: ";
+      if (deepSleepWeekends && (localInfo.tm_wday == 0 || localInfo.tm_wday == 6)) {
+        nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+      } else if (localInfo.tm_hour >= businessHoursEnd) {
+        // After hours - wake tomorrow
+        if (deepSleepWeekends && ((localInfo.tm_wday + 1) % 7 == 0 || (localInfo.tm_wday + 1) % 7 == 6)) {
+          nextUpdate += "Monday " + String(businessHoursStart) + ":00";
+        } else {
+          nextUpdate += "Tomorrow " + String(businessHoursStart) + ":00";
+        }
+      } else {
+        // Before hours - wake today
+        nextUpdate += "Today " + String(businessHoursStart) + ":00";
+      }
+      
+      canvas.drawString(nextUpdate.c_str(), PORTRAIT_WIDTH / 2, messageY);
+    } else if (enableBatterySaver) {
       String msg = occupied ? "Battery saver mode enabled." : "Saving battery while vacant.";
       canvas.drawString(msg.c_str(), PORTRAIT_WIDTH / 2, messageY);
       messageY += 36;
@@ -760,32 +794,6 @@ void drawUI() {
         snprintf(buf, sizeof(buf), "Next check: %d:%02d %s", hour12, nextWake.tm_min, ampm);
       }
       canvas.drawString(buf, PORTRAIT_WIDTH / 2, messageY);
-    } else {
-      canvas.drawString("Device is sleeping.", PORTRAIT_WIDTH / 2, messageY);
-      messageY += 36;
-      
-      // Calculate and show next wake time
-      time_t nowSecs = time(nullptr);
-      time_t localSecs = nowSecs + (tzOffsetMinutes * 60);
-      struct tm localInfo;
-      gmtime_r(&localSecs, &localInfo);
-      
-      String nextUpdate = "Next update: ";
-      if (deepSleepWeekends && (localInfo.tm_wday == 0 || localInfo.tm_wday == 6)) {
-        nextUpdate += "Monday " + String(businessHoursStart) + ":00";
-      } else if (localInfo.tm_hour >= businessHoursEnd) {
-        // After hours - wake tomorrow
-        if (deepSleepWeekends && ((localInfo.tm_wday + 1) % 7 == 0 || (localInfo.tm_wday + 1) % 7 == 6)) {
-          nextUpdate += "Monday " + String(businessHoursStart) + ":00";
-        } else {
-          nextUpdate += "Tomorrow " + String(businessHoursStart) + ":00";
-        }
-      } else {
-        // Before hours - wake today
-        nextUpdate += "Today " + String(businessHoursStart) + ":00";
-      }
-      
-      canvas.drawString(nextUpdate.c_str(), PORTRAIT_WIDTH / 2, messageY);
     }
     canvas.setTextDatum(TL_DATUM);
   }
