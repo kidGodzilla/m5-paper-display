@@ -225,6 +225,9 @@ static void logWakeCause() {
     consecutiveTimerWakeMisses = 0;
     consecutiveExt0Bounces = 0;
     ext0CooldownUntilMs = 0;
+  } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+    // Button wake during deep sleep is expected; don't count as an error
+    consecutiveTimerWakeMisses = 0;
   } else if (cause != ESP_SLEEP_WAKEUP_EXT0) {
     consecutiveTimerWakeMisses++;
     if (consecutiveTimerWakeMisses >= 3) {
@@ -319,6 +322,8 @@ static void rearmAndSleep() {
     Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
     Serial.println("Entering deep sleep NOW (battery saver)");
     Serial.flush();
+    // Track sleep start time for diagnostics
+    lastSleepMs = millis();
     
     delay(200);
     esp_deep_sleep_start();
@@ -352,6 +357,8 @@ static void rearmAndSleep() {
     Serial.printf("EXT1 wake armed: %s (G37/G38/G39)\n", err == ESP_OK ? "OK" : "FAILED");
     Serial.println("Entering deep sleep NOW");
     Serial.flush();
+    // Track sleep start time for diagnostics
+    lastSleepMs = millis();
     
     delay(200);
     esp_deep_sleep_start();
